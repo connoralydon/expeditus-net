@@ -31,8 +31,7 @@ nix run . -- \
   --advertise-address 10.0.0.1 \
   --neighbor 10.0.0.2 \
   --protocol udp \
-  --bandwidth 100M \
-  --directions forward,reverse
+  --bandwidth 100M
 ```
 
 Run the same daemon on the neighbor with the opposite bind and neighbor addresses.
@@ -69,7 +68,6 @@ Set `--token` or `--token-file` on every node to require a shared bearer token f
             iperfPortRange = "5201-5210";
             protocol = "udp";
             bandwidth = "100M";
-            directions = [ "forward" "reverse" ];
             openFirewall = true;
           };
         }
@@ -80,25 +78,6 @@ Set `--token` or `--token-file` on every node to require a shared bearer token f
 ```
 
 `neighbors` can be plain IPs, `host:port`, or full `http://host:port` URLs. Plain IPs use the configured control port.
-
-## Alloy Example
-
-```river
-prometheus.scrape "expeditus_net" {
-  targets = [
-    { __address__ = "10.0.0.1:9119" },
-    { __address__ = "10.0.0.2:9119" },
-  ]
-
-  forward_to = [prometheus.remote_write.victoriametrics.receiver]
-}
-
-prometheus.remote_write "victoriametrics" {
-  endpoint {
-    url = "http://victoriametrics:8428/api/v1/write"
-  }
-}
-```
 
 ## Development
 

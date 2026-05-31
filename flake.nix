@@ -81,7 +81,6 @@
             "--duration" cfg.duration
             "--protocol" cfg.protocol
             "--bandwidth" cfg.bandwidth
-            "--directions" (lib.concatStringsSep "," cfg.directions)
           ]
           ++ lib.optionals (cfg.advertiseAddress != null) [ "--advertise-address" cfg.advertiseAddress ]
           ++ lib.optionals (cfg.tokenFile != null) [ "--token-file" cfg.tokenFile ]
@@ -158,12 +157,6 @@
               type = lib.types.str;
               default = "100M";
               description = "Target UDP bandwidth passed to iperf3.";
-            };
-
-            directions = lib.mkOption {
-              type = lib.types.listOf (lib.types.enum [ "forward" "reverse" ]);
-              default = [ "forward" "reverse" ];
-              description = "Traffic directions to test for each negotiated client/server role.";
             };
 
             tokenFile = lib.mkOption {

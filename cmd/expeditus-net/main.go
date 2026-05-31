@@ -30,7 +30,6 @@ const (
 	defaultIperfPortRange = "5201-5210"
 	defaultProtocol       = "udp"
 	defaultBandwidth      = "100M"
-	defaultDirections     = "forward,reverse"
 	defaultInterval       = 60 * time.Second
 	defaultDuration       = 5 * time.Second
 	serverReadyDelay      = 150 * time.Millisecond
@@ -59,7 +58,6 @@ type config struct {
 	TestTimeout      time.Duration
 	Protocol         string
 	Bandwidth        string
-	Directions       []string
 	Token            string
 	Once             bool
 }
@@ -87,7 +85,6 @@ type negotiateRequest struct {
 	Protocol        string `json:"protocol"`
 	DurationSeconds int    `json:"duration_seconds"`
 	Bandwidth       string `json:"bandwidth"`
-	Direction       string `json:"direction"`
 }
 
 type negotiateResponse struct {
@@ -107,7 +104,6 @@ type clientRunRequest struct {
 	Protocol        string `json:"protocol"`
 	DurationSeconds int    `json:"duration_seconds"`
 	Bandwidth       string `json:"bandwidth"`
-	Direction       string `json:"direction"`
 }
 
 type clientRunResponse struct {
@@ -127,12 +123,11 @@ type probeResult struct {
 }
 
 type metricKey struct {
-	LocalNode        string
-	PeerNode         string
-	ClientNode       string
-	ServerNode       string
-	Protocol         string
-	TrafficDirection string
+	LocalNode  string
+	PeerNode   string
+	ClientNode string
+	ServerNode string
+	Protocol   string
 }
 
 type metricSample struct {
@@ -216,7 +211,6 @@ func parseConfig(args []string) (*config, error) {
 	}
 
 	var neighbors stringList
-	var directions string
 	var portRange string
 	var tokenFile string
 
@@ -233,7 +227,6 @@ func parseConfig(args []string) (*config, error) {
 	fs.DurationVar(&cfg.TestTimeout, "test-timeout", 0, "overall timeout per iperf3 test; defaults to duration plus 15s")
 	fs.StringVar(&cfg.Protocol, "protocol", defaultProtocol, "iperf3 protocol: udp or tcp")
 	fs.StringVar(&cfg.Bandwidth, "bandwidth", defaultBandwidth, "iperf3 UDP target bandwidth, for example 100M")
-	fs.StringVar(&directions, "directions", defaultDirections, "comma-separated traffic directions: forward,reverse")
 	fs.StringVar(&cfg.Token, "token", "", "shared bearer token for peer control requests")
 	fs.StringVar(&tokenFile, "token-file", "", "file containing the shared bearer token")
 	fs.BoolVar(&cfg.Once, "once", false, "run one probe round and exit")
@@ -256,12 +249,7 @@ func parseConfig(args []string) (*config, error) {
 		return nil, fmt.Errorf("duration must be greater than zero")
 	}
 
-	parsedDirections, err := parseDirections(directions)
-	if err != nil {
-		return nil, err
-	}
-	cfg.Directions = parsedDirections
-
+	var err error
 	cfg.IperfPorts, err = parsePortRange(portRange)
 	if err != nil {
 		return nil, err
@@ -292,30 +280,6 @@ func parseConfig(args []string) (*config, error) {
 	}
 
 	return cfg, nil
-}
-
-func parseDirections(value string) ([]string, error) {
-	parts := strings.Split(value, ",")
-	directions := make([]string, 0, len(parts))
-	seen := make(map[string]struct{})
-	for _, part := range parts {
-		direction := strings.ToLower(strings.TrimSpace(part))
-		if direction == "" {
-			continue
-		}
-		if direction != "forward" && direction != "reverse" {
-			return nil, fmt.Errorf("direction must be forward or reverse: %q", direction)
-		}
-		if _, ok := seen[direction]; ok {
-			continue
-		}
-		seen[direction] = struct{}{}
-		directions = append(directions, direction)
-	}
-	if len(directions) == 0 {
-		return nil, fmt.Errorf("at least one direction is required")
-	}
-	return directions, nil
 }
 
 func parsePortRange(value string) ([]int, error) {
@@ -494,7 +458,7 @@ func (a *app) handleNegotiate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, negotiateResponse{Accepted: false, Error: err.Error()})
 		return
 	}
-	if err := validateProbeRequest(req.Protocol, req.DurationSeconds, req.Bandwidth, req.Direction); err != nil {
+	if err := validateProbeRequest(req.Protocol, req.DurationSeconds, req.Bandwidth); err != nil {
 		writeJSON(w, http.StatusBadRequest, negotiateResponse{Accepted: false, Error: err.Error()})
 		return
 	}
@@ -529,7 +493,7 @@ func (a *app) handleClientRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, clientRunResponse{Accepted: false, Error: err.Error()})
 		return
 	}
-	if err := validateProbeRequest(req.Protocol, req.DurationSeconds, req.Bandwidth, req.Direction); err != nil {
+	if err := validateProbeRequest(req.Protocol, req.DurationSeconds, req.Bandwidth); err != nil {
 		writeJSON(w, http.StatusBadRequest, clientRunResponse{Accepted: false, Error: err.Error()})
 		return
 	}
@@ -543,15 +507,14 @@ func (a *app) handleClientRun(w http.ResponseWriter, r *http.Request) {
 		serverNode = req.ServerHost
 	}
 
-	result := a.runIperfClient(r.Context(), req.ServerHost, req.ServerPort, req.Protocol, req.Bandwidth, req.DurationSeconds, req.Direction)
+	result := a.runIperfClient(r.Context(), req.ServerHost, req.ServerPort, req.Protocol, req.Bandwidth, req.DurationSeconds)
 	a.metrics.Record(metricSample{
 		Key: metricKey{
-			LocalNode:        a.cfg.NodeName,
-			PeerNode:         serverNode,
-			ClientNode:       a.cfg.NodeName,
-			ServerNode:       serverNode,
-			Protocol:         req.Protocol,
-			TrafficDirection: req.Direction,
+			LocalNode:  a.cfg.NodeName,
+			PeerNode:   serverNode,
+			ClientNode: a.cfg.NodeName,
+			ServerNode: serverNode,
+			Protocol:   req.Protocol,
 		},
 		Success:                result.Success,
 		BandwidthBitsPerSecond: result.BandwidthBitsPerSecond,
@@ -604,7 +567,7 @@ func methodNotAllowed(w http.ResponseWriter) {
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }
 
-func validateProbeRequest(protocol string, durationSeconds int, bandwidth string, direction string) error {
+func validateProbeRequest(protocol string, durationSeconds int, bandwidth string) error {
 	if protocol != "udp" && protocol != "tcp" {
 		return fmt.Errorf("protocol must be udp or tcp")
 	}
@@ -613,9 +576,6 @@ func validateProbeRequest(protocol string, durationSeconds int, bandwidth string
 	}
 	if protocol == "udp" && strings.TrimSpace(bandwidth) == "" {
 		return fmt.Errorf("bandwidth is required for udp probes")
-	}
-	if direction != "forward" && direction != "reverse" {
-		return fmt.Errorf("direction must be forward or reverse")
 	}
 	return nil
 }
@@ -654,17 +614,15 @@ func (a *app) runRound(ctx context.Context) {
 	durationSeconds := secondsCeil(a.cfg.Duration)
 	for _, n := range a.cfg.Neighbors {
 		localClient := a.nextLocalClient(n.Node)
-		for _, direction := range a.cfg.Directions {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			if localClient {
-				a.runLocalClientProbe(ctx, n, direction, durationSeconds)
-			} else {
-				a.runRemoteClientProbe(ctx, n, direction, durationSeconds)
-			}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if localClient {
+			a.runLocalClientProbe(ctx, n, durationSeconds)
+		} else {
+			a.runRemoteClientProbe(ctx, n, durationSeconds)
 		}
 	}
 }
@@ -677,7 +635,7 @@ func (a *app) nextLocalClient(peer string) bool {
 	return count%2 == 0
 }
 
-func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, direction string, durationSeconds int) {
+func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, durationSeconds int) {
 	started := time.Now()
 	var resp negotiateResponse
 	requestCtx, cancel := context.WithTimeout(ctx, a.timeoutForSeconds(durationSeconds)+5*time.Second)
@@ -687,14 +645,13 @@ func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, direction str
 		Protocol:        a.cfg.Protocol,
 		DurationSeconds: durationSeconds,
 		Bandwidth:       a.cfg.Bandwidth,
-		Direction:       direction,
 	}, &resp)
 	if err != nil || !resp.Accepted {
 		if err == nil {
 			err = errors.New(resp.Error)
 		}
-		log.Printf("probe negotiation failed peer=%s direction=%s: %v", n.Node, direction, err)
-		a.recordFailure(n.Node, a.cfg.NodeName, n.Node, a.cfg.Protocol, direction, time.Since(started))
+		log.Printf("probe negotiation failed peer=%s: %v", n.Node, err)
+		a.recordFailure(n.Node, a.cfg.NodeName, n.Node, a.cfg.Protocol, time.Since(started))
 		return
 	}
 
@@ -703,22 +660,22 @@ func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, direction str
 		serverNode = n.Node
 	}
 	serverHost := usableServerHost(resp.ServerHost, n.Node)
-	result := a.runIperfClient(ctx, serverHost, resp.ServerPort, a.cfg.Protocol, a.cfg.Bandwidth, durationSeconds, direction)
-	a.metrics.Record(sampleFromResult(a.cfg.NodeName, serverNode, a.cfg.NodeName, serverNode, a.cfg.Protocol, direction, result))
+	result := a.runIperfClient(ctx, serverHost, resp.ServerPort, a.cfg.Protocol, a.cfg.Bandwidth, durationSeconds)
+	a.metrics.Record(sampleFromResult(a.cfg.NodeName, serverNode, a.cfg.NodeName, serverNode, a.cfg.Protocol, result))
 
 	if result.Success {
-		log.Printf("probe succeeded peer=%s role=client direction=%s bandwidth_bps=%.0f jitter_s=%.6f", n.Node, direction, result.BandwidthBitsPerSecond, result.JitterSeconds)
+		log.Printf("probe succeeded peer=%s role=client bandwidth_bps=%.0f jitter_s=%.6f", n.Node, result.BandwidthBitsPerSecond, result.JitterSeconds)
 	} else {
-		log.Printf("probe failed peer=%s role=client direction=%s: %s", n.Node, direction, result.Error)
+		log.Printf("probe failed peer=%s role=client: %s", n.Node, result.Error)
 	}
 }
 
-func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, direction string, durationSeconds int) {
+func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, durationSeconds int) {
 	started := time.Now()
 	port, _, err := a.startIperfServer(a.timeoutForSeconds(durationSeconds))
 	if err != nil {
-		log.Printf("local iperf server failed peer=%s direction=%s: %v", n.Node, direction, err)
-		a.recordFailure(n.Node, n.Node, a.cfg.NodeName, a.cfg.Protocol, direction, time.Since(started))
+		log.Printf("local iperf server failed peer=%s: %v", n.Node, err)
+		a.recordFailure(n.Node, n.Node, a.cfg.NodeName, a.cfg.Protocol, time.Since(started))
 		return
 	}
 
@@ -732,32 +689,30 @@ func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, direction st
 		Protocol:        a.cfg.Protocol,
 		DurationSeconds: durationSeconds,
 		Bandwidth:       a.cfg.Bandwidth,
-		Direction:       direction,
 	}, &resp)
 	if err != nil || !resp.Accepted {
 		if err == nil {
 			err = errors.New(resp.Error)
 		}
-		log.Printf("remote client probe failed peer=%s direction=%s: %v", n.Node, direction, err)
-		a.recordFailure(n.Node, n.Node, a.cfg.NodeName, a.cfg.Protocol, direction, time.Since(started))
+		log.Printf("remote client probe failed peer=%s: %v", n.Node, err)
+		a.recordFailure(n.Node, n.Node, a.cfg.NodeName, a.cfg.Protocol, time.Since(started))
 		return
 	}
 	if resp.Result.Success {
-		log.Printf("probe succeeded peer=%s role=server direction=%s bandwidth_bps=%.0f jitter_s=%.6f", n.Node, direction, resp.Result.BandwidthBitsPerSecond, resp.Result.JitterSeconds)
+		log.Printf("probe succeeded peer=%s role=server bandwidth_bps=%.0f jitter_s=%.6f", n.Node, resp.Result.BandwidthBitsPerSecond, resp.Result.JitterSeconds)
 	} else {
-		log.Printf("probe failed peer=%s role=server direction=%s: %s", n.Node, direction, resp.Result.Error)
+		log.Printf("probe failed peer=%s role=server: %s", n.Node, resp.Result.Error)
 	}
 }
 
-func (a *app) recordFailure(peerNode string, clientNode string, serverNode string, protocol string, direction string, duration time.Duration) {
+func (a *app) recordFailure(peerNode string, clientNode string, serverNode string, protocol string, duration time.Duration) {
 	a.metrics.Record(metricSample{
 		Key: metricKey{
-			LocalNode:        a.cfg.NodeName,
-			PeerNode:         peerNode,
-			ClientNode:       clientNode,
-			ServerNode:       serverNode,
-			Protocol:         protocol,
-			TrafficDirection: direction,
+			LocalNode:  a.cfg.NodeName,
+			PeerNode:   peerNode,
+			ClientNode: clientNode,
+			ServerNode: serverNode,
+			Protocol:   protocol,
 		},
 		Success:              false,
 		ProbeDurationSeconds: duration.Seconds(),
@@ -765,15 +720,14 @@ func (a *app) recordFailure(peerNode string, clientNode string, serverNode strin
 	})
 }
 
-func sampleFromResult(localNode string, peerNode string, clientNode string, serverNode string, protocol string, direction string, result probeResult) metricSample {
+func sampleFromResult(localNode string, peerNode string, clientNode string, serverNode string, protocol string, result probeResult) metricSample {
 	return metricSample{
 		Key: metricKey{
-			LocalNode:        localNode,
-			PeerNode:         peerNode,
-			ClientNode:       clientNode,
-			ServerNode:       serverNode,
-			Protocol:         protocol,
-			TrafficDirection: direction,
+			LocalNode:  localNode,
+			PeerNode:   peerNode,
+			ClientNode: clientNode,
+			ServerNode: serverNode,
+			Protocol:   protocol,
 		},
 		Success:                result.Success,
 		BandwidthBitsPerSecond: result.BandwidthBitsPerSecond,
@@ -896,7 +850,7 @@ func (a *app) releasePort(port int) {
 	delete(a.activeServers, port)
 }
 
-func (a *app) runIperfClient(ctx context.Context, serverHost string, serverPort int, protocol string, bandwidth string, durationSeconds int, direction string) probeResult {
+func (a *app) runIperfClient(ctx context.Context, serverHost string, serverPort int, protocol string, bandwidth string, durationSeconds int) probeResult {
 	started := time.Now()
 	testCtx, cancel := context.WithTimeout(ctx, a.timeoutForSeconds(durationSeconds))
 	defer cancel()
@@ -904,9 +858,6 @@ func (a *app) runIperfClient(ctx context.Context, serverHost string, serverPort 
 	args := []string{"-c", serverHost, "-p", strconv.Itoa(serverPort), "-t", strconv.Itoa(durationSeconds), "--json"}
 	if protocol == "udp" {
 		args = append(args, "--udp", "--bandwidth", bandwidth)
-	}
-	if direction == "reverse" {
-		args = append(args, "--reverse")
 	}
 
 	cmd := exec.CommandContext(testCtx, "iperf3", args...)
@@ -1089,7 +1040,7 @@ func (m *metricStore) Render() string {
 }
 
 func (k metricKey) String() string {
-	return strings.Join([]string{k.LocalNode, k.PeerNode, k.ClientNode, k.ServerNode, k.Protocol, k.TrafficDirection}, "\xff")
+	return strings.Join([]string{k.LocalNode, k.PeerNode, k.ClientNode, k.ServerNode, k.Protocol}, "\xff")
 }
 
 func (k metricKey) Labels() string {
@@ -1099,7 +1050,6 @@ func (k metricKey) Labels() string {
 		`client_node="` + escapeLabel(k.ClientNode) + `"`,
 		`server_node="` + escapeLabel(k.ServerNode) + `"`,
 		`protocol="` + escapeLabel(k.Protocol) + `"`,
-		`traffic_direction="` + escapeLabel(k.TrafficDirection) + `"`,
 	}
 	return strings.Join(labels, ",")
 }

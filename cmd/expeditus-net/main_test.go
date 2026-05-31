@@ -67,12 +67,11 @@ func TestMetricsRender(t *testing.T) {
 	store := newMetricStore()
 	store.Record(metricSample{
 		Key: metricKey{
-			LocalNode:        "a",
-			PeerNode:         "b",
-			ClientNode:       "a",
-			ServerNode:       "b",
-			Protocol:         "udp",
-			TrafficDirection: "forward",
+			LocalNode:  "a",
+			PeerNode:   "b",
+			ClientNode: "a",
+			ServerNode: "b",
+			Protocol:   "udp",
 		},
 		Success:                true,
 		BandwidthBitsPerSecond: 100,
@@ -82,7 +81,7 @@ func TestMetricsRender(t *testing.T) {
 	})
 
 	rendered := store.Render()
-	if !strings.Contains(rendered, `expeditus_iperf_probe_success{local_node="a",peer_node="b",client_node="a",server_node="b",protocol="udp",traffic_direction="forward"} 1`) {
+	if !strings.Contains(rendered, `expeditus_iperf_probe_success{local_node="a",peer_node="b",client_node="a",server_node="b",protocol="udp"} 1`) {
 		t.Fatalf("rendered metrics missing success sample:\n%s", rendered)
 	}
 }
