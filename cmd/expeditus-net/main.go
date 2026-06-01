@@ -28,8 +28,8 @@ import (
 const (
 	defaultBindAddress    = ":9119"
 	defaultIperfPortRange = "5201-5210"
-	defaultProtocol       = "udp"
-	defaultBandwidth      = "100M"
+	defaultProtocol       = "both"
+	defaultBandwidth      = "10M"
 	defaultInterval       = 60 * time.Second
 	defaultDuration       = 5 * time.Second
 	serverReadyDelay      = 150 * time.Millisecond
@@ -75,9 +75,18 @@ type app struct {
 
 	activeMu      sync.Mutex
 	activeServers map[int]struct{}
+	testMu        sync.Mutex
+	testActive    bool
 
 	roleMu     sync.Mutex
 	roleCounts map[string]int
+
+	peerMu    sync.Mutex
+	peerNames map[string]string
+}
+
+type infoResponse struct {
+	NodeName string `json:"node_name"`
 }
 
 type negotiateRequest struct {
@@ -146,6 +155,18 @@ type metricStore struct {
 	samples map[metricKey]metricSample
 }
 
+type httpStatusError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *httpStatusError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("peer returned HTTP %d", e.StatusCode)
+	}
+	return fmt.Sprintf("peer returned HTTP %d: %s", e.StatusCode, e.Message)
+}
+
 func main() {
 	cfg, err := parseConfig(os.Args[1:])
 	if err != nil {
@@ -164,6 +185,7 @@ func main() {
 		metrics:       newMetricStore(),
 		activeServers: make(map[int]struct{}),
 		roleCounts:    make(map[string]int),
+		peerNames:     make(map[string]string),
 	}
 
 	server := &http.Server{
@@ -225,8 +247,8 @@ func parseConfig(args []string) (*config, error) {
 	fs.DurationVar(&cfg.Interval, "interval", defaultInterval, "interval between probe rounds")
 	fs.DurationVar(&cfg.Duration, "duration", defaultDuration, "iperf3 test duration")
 	fs.DurationVar(&cfg.TestTimeout, "test-timeout", 0, "overall timeout per iperf3 test; defaults to duration plus 15s")
-	fs.StringVar(&cfg.Protocol, "protocol", defaultProtocol, "iperf3 protocol: udp or tcp")
-	fs.StringVar(&cfg.Bandwidth, "bandwidth", defaultBandwidth, "iperf3 UDP target bandwidth, for example 100M")
+	fs.StringVar(&cfg.Protocol, "protocol", defaultProtocol, "iperf3 protocol: both, udp, or tcp")
+	fs.StringVar(&cfg.Bandwidth, "bandwidth", defaultBandwidth, "iperf3 UDP target bandwidth, for example 10M")
 	fs.StringVar(&cfg.Token, "token", "", "shared bearer token for peer control requests")
 	fs.StringVar(&tokenFile, "token-file", "", "file containing the shared bearer token")
 	fs.BoolVar(&cfg.Once, "once", false, "run one probe round and exit")
@@ -236,10 +258,10 @@ func parseConfig(args []string) (*config, error) {
 	}
 
 	cfg.Protocol = strings.ToLower(strings.TrimSpace(cfg.Protocol))
-	if cfg.Protocol != "udp" && cfg.Protocol != "tcp" {
-		return nil, fmt.Errorf("protocol must be udp or tcp")
+	if cfg.Protocol != "both" && cfg.Protocol != "udp" && cfg.Protocol != "tcp" {
+		return nil, fmt.Errorf("protocol must be both, udp, or tcp")
 	}
-	if cfg.Protocol == "udp" && strings.TrimSpace(cfg.Bandwidth) == "" {
+	if cfg.Protocol != "tcp" && strings.TrimSpace(cfg.Bandwidth) == "" {
 		return nil, fmt.Errorf("bandwidth is required for udp probes")
 	}
 	if cfg.Interval <= 0 {
@@ -417,10 +439,37 @@ func secondsCeil(duration time.Duration) int {
 	return int(math.Ceil(duration.Seconds()))
 }
 
+func (cfg *config) probeProtocols() []string {
+	if cfg.Protocol == "both" {
+		return []string{"udp", "tcp"}
+	}
+	return []string{cfg.Protocol}
+}
+
+func normalizeNodeID(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func pairOwner(a string, b string) string {
+	a = normalizeNodeID(a)
+	b = normalizeNodeID(b)
+	if a <= b {
+		return a
+	}
+	return b
+}
+
+func initiatorOwnsPair(initiator string, peer string) bool {
+	initiator = normalizeNodeID(initiator)
+	peer = normalizeNodeID(peer)
+	return initiator != "" && peer != "" && initiator < peer
+}
+
 func (a *app) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", a.handleHealth)
 	mux.HandleFunc("/metrics", a.handleMetrics)
+	mux.HandleFunc("/v1/info", a.handleInfo)
 	mux.HandleFunc("/v1/negotiate", a.handleNegotiate)
 	mux.HandleFunc("/v1/iperf/client/run", a.handleClientRun)
 	return mux
@@ -444,6 +493,17 @@ func (a *app) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, a.metrics.Render())
 }
 
+func (a *app) handleInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !a.authorize(w, r) {
+		return
+	}
+	writeJSON(w, http.StatusOK, infoResponse{NodeName: a.cfg.NodeName})
+}
+
 func (a *app) handleNegotiate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -462,12 +522,27 @@ func (a *app) handleNegotiate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, negotiateResponse{Accepted: false, Error: err.Error()})
 		return
 	}
+	if strings.TrimSpace(req.ClientNode) == "" {
+		writeJSON(w, http.StatusBadRequest, negotiateResponse{Accepted: false, Error: "client_node is required"})
+		return
+	}
+	if !initiatorOwnsPair(req.ClientNode, a.cfg.NodeName) {
+		writeJSON(w, http.StatusConflict, negotiateResponse{Accepted: false, Error: "peer pair is owned by " + pairOwner(req.ClientNode, a.cfg.NodeName)})
+		return
+	}
+	releaseTest, ok := a.tryAcquireTestSlot()
+	if !ok {
+		writeJSON(w, http.StatusConflict, negotiateResponse{Accepted: false, Error: "node is already running a test"})
+		return
+	}
 
-	port, expiresAt, err := a.startIperfServer(a.timeoutForSeconds(req.DurationSeconds))
+	port, expiresAt, done, _, err := a.startIperfServer(a.timeoutForSeconds(req.DurationSeconds))
 	if err != nil {
+		releaseTest()
 		writeJSON(w, http.StatusServiceUnavailable, negotiateResponse{Accepted: false, Error: err.Error()})
 		return
 	}
+	releaseTestSlotWhenDone(done, releaseTest)
 
 	writeJSON(w, http.StatusOK, negotiateResponse{
 		Accepted:   true,
@@ -497,15 +572,26 @@ func (a *app) handleClientRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, clientRunResponse{Accepted: false, Error: err.Error()})
 		return
 	}
+	if strings.TrimSpace(req.ServerNode) == "" {
+		writeJSON(w, http.StatusBadRequest, clientRunResponse{Accepted: false, Error: "server_node is required"})
+		return
+	}
+	if !initiatorOwnsPair(req.ServerNode, a.cfg.NodeName) {
+		writeJSON(w, http.StatusConflict, clientRunResponse{Accepted: false, Error: "peer pair is owned by " + pairOwner(req.ServerNode, a.cfg.NodeName)})
+		return
+	}
 	if req.ServerHost == "" || req.ServerPort < 1 || req.ServerPort > 65535 {
 		writeJSON(w, http.StatusBadRequest, clientRunResponse{Accepted: false, Error: "server_host and valid server_port are required"})
 		return
 	}
+	releaseTest, ok := a.tryAcquireTestSlot()
+	if !ok {
+		writeJSON(w, http.StatusConflict, clientRunResponse{Accepted: false, Error: "node is already running a test"})
+		return
+	}
+	defer releaseTest()
 
 	serverNode := req.ServerNode
-	if serverNode == "" {
-		serverNode = req.ServerHost
-	}
 
 	result := a.runIperfClient(r.Context(), req.ServerHost, req.ServerPort, req.Protocol, req.Bandwidth, req.DurationSeconds)
 	a.metrics.Record(metricSample{
@@ -613,16 +699,36 @@ func (a *app) runRound(ctx context.Context) {
 	}
 	durationSeconds := secondsCeil(a.cfg.Duration)
 	for _, n := range a.cfg.Neighbors {
-		localClient := a.nextLocalClient(n.Node)
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		if localClient {
-			a.runLocalClientProbe(ctx, n, durationSeconds)
-		} else {
-			a.runRemoteClientProbe(ctx, n, durationSeconds)
+		peerName, err := a.peerNodeName(ctx, n)
+		if err != nil {
+			log.Printf("peer info failed peer=%s: %v", n.Node, err)
+			continue
+		}
+		if normalizeNodeID(peerName) == normalizeNodeID(a.cfg.NodeName) {
+			log.Printf("probe skipped peer=%s: peer node name matches local node", n.Node)
+			continue
+		}
+		if !initiatorOwnsPair(a.cfg.NodeName, peerName) {
+			continue
+		}
+
+		localClient := a.nextLocalClient(peerName)
+		for _, protocol := range a.cfg.probeProtocols() {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			if localClient {
+				a.runLocalClientProbe(ctx, n, peerName, protocol, durationSeconds)
+			} else {
+				a.runRemoteClientProbe(ctx, n, peerName, protocol, durationSeconds)
+			}
 		}
 	}
 }
@@ -635,14 +741,51 @@ func (a *app) nextLocalClient(peer string) bool {
 	return count%2 == 0
 }
 
-func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, durationSeconds int) {
+func (a *app) tryAcquireTestSlot() (func(), bool) {
+	a.testMu.Lock()
+	defer a.testMu.Unlock()
+	if a.testActive {
+		return nil, false
+	}
+	a.testActive = true
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			a.testMu.Lock()
+			defer a.testMu.Unlock()
+			a.testActive = false
+		})
+	}
+	return release, true
+}
+
+func releaseTestSlotWhenDone(done <-chan error, release func()) {
+	go func() {
+		<-done
+		release()
+	}()
+}
+
+func isPeerConflict(err error) bool {
+	var statusErr *httpStatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusConflict
+}
+
+func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, peerName string, protocol string, durationSeconds int) {
 	started := time.Now()
+	releaseTest, ok := a.tryAcquireTestSlot()
+	if !ok {
+		log.Printf("probe skipped peer=%s: node is already running a test", peerName)
+		return
+	}
+	defer releaseTest()
+
 	var resp negotiateResponse
 	requestCtx, cancel := context.WithTimeout(ctx, a.timeoutForSeconds(durationSeconds)+5*time.Second)
 	defer cancel()
 	err := a.postJSON(requestCtx, n, "/v1/negotiate", negotiateRequest{
 		ClientNode:      a.cfg.NodeName,
-		Protocol:        a.cfg.Protocol,
+		Protocol:        protocol,
 		DurationSeconds: durationSeconds,
 		Bandwidth:       a.cfg.Bandwidth,
 	}, &resp)
@@ -650,34 +793,46 @@ func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, durationSecon
 		if err == nil {
 			err = errors.New(resp.Error)
 		}
-		log.Printf("probe negotiation failed peer=%s: %v", n.Node, err)
-		a.recordFailure(n.Node, a.cfg.NodeName, n.Node, a.cfg.Protocol, time.Since(started))
+		if isPeerConflict(err) {
+			log.Printf("probe skipped peer=%s: %v", peerName, err)
+			return
+		}
+		log.Printf("probe negotiation failed peer=%s: %v", peerName, err)
+		a.recordFailure(peerName, a.cfg.NodeName, peerName, protocol, time.Since(started))
 		return
 	}
 
 	serverNode := resp.ServerNode
 	if serverNode == "" {
-		serverNode = n.Node
+		serverNode = peerName
 	}
 	serverHost := usableServerHost(resp.ServerHost, n.Node)
-	result := a.runIperfClient(ctx, serverHost, resp.ServerPort, a.cfg.Protocol, a.cfg.Bandwidth, durationSeconds)
-	a.metrics.Record(sampleFromResult(a.cfg.NodeName, serverNode, a.cfg.NodeName, serverNode, a.cfg.Protocol, result))
+	result := a.runIperfClient(ctx, serverHost, resp.ServerPort, protocol, a.cfg.Bandwidth, durationSeconds)
+	a.metrics.Record(sampleFromResult(a.cfg.NodeName, serverNode, a.cfg.NodeName, serverNode, protocol, result))
 
 	if result.Success {
-		log.Printf("probe succeeded peer=%s role=client bandwidth_bps=%.0f jitter_s=%.6f", n.Node, result.BandwidthBitsPerSecond, result.JitterSeconds)
+		log.Printf("probe succeeded peer=%s protocol=%s role=client bandwidth_bps=%.0f jitter_s=%.6f", peerName, protocol, result.BandwidthBitsPerSecond, result.JitterSeconds)
 	} else {
-		log.Printf("probe failed peer=%s role=client: %s", n.Node, result.Error)
+		log.Printf("probe failed peer=%s protocol=%s role=client: %s", peerName, protocol, result.Error)
 	}
 }
 
-func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, durationSeconds int) {
+func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, peerName string, protocol string, durationSeconds int) {
 	started := time.Now()
-	port, _, err := a.startIperfServer(a.timeoutForSeconds(durationSeconds))
-	if err != nil {
-		log.Printf("local iperf server failed peer=%s: %v", n.Node, err)
-		a.recordFailure(n.Node, n.Node, a.cfg.NodeName, a.cfg.Protocol, time.Since(started))
+	releaseTest, ok := a.tryAcquireTestSlot()
+	if !ok {
+		log.Printf("probe skipped peer=%s: node is already running a test", peerName)
 		return
 	}
+
+	port, _, done, stopServer, err := a.startIperfServer(a.timeoutForSeconds(durationSeconds))
+	if err != nil {
+		releaseTest()
+		log.Printf("local iperf server failed peer=%s: %v", peerName, err)
+		a.recordFailure(peerName, peerName, a.cfg.NodeName, protocol, time.Since(started))
+		return
+	}
+	releaseTestSlotWhenDone(done, releaseTest)
 
 	var resp clientRunResponse
 	requestCtx, cancel := context.WithTimeout(ctx, a.timeoutForSeconds(durationSeconds)+5*time.Second)
@@ -686,22 +841,27 @@ func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, durationSeco
 		ServerNode:      a.cfg.NodeName,
 		ServerHost:      a.cfg.AdvertiseAddress,
 		ServerPort:      port,
-		Protocol:        a.cfg.Protocol,
+		Protocol:        protocol,
 		DurationSeconds: durationSeconds,
 		Bandwidth:       a.cfg.Bandwidth,
 	}, &resp)
 	if err != nil || !resp.Accepted {
+		stopServer()
 		if err == nil {
 			err = errors.New(resp.Error)
 		}
-		log.Printf("remote client probe failed peer=%s: %v", n.Node, err)
-		a.recordFailure(n.Node, n.Node, a.cfg.NodeName, a.cfg.Protocol, time.Since(started))
+		if isPeerConflict(err) {
+			log.Printf("probe skipped peer=%s: %v", peerName, err)
+			return
+		}
+		log.Printf("remote client probe failed peer=%s: %v", peerName, err)
+		a.recordFailure(peerName, peerName, a.cfg.NodeName, protocol, time.Since(started))
 		return
 	}
 	if resp.Result.Success {
-		log.Printf("probe succeeded peer=%s role=server bandwidth_bps=%.0f jitter_s=%.6f", n.Node, resp.Result.BandwidthBitsPerSecond, resp.Result.JitterSeconds)
+		log.Printf("probe succeeded peer=%s protocol=%s role=server bandwidth_bps=%.0f jitter_s=%.6f", peerName, protocol, resp.Result.BandwidthBitsPerSecond, resp.Result.JitterSeconds)
 	} else {
-		log.Printf("probe failed peer=%s role=server: %s", n.Node, resp.Result.Error)
+		log.Printf("probe failed peer=%s protocol=%s role=server: %s", peerName, protocol, resp.Result.Error)
 	}
 }
 
@@ -772,18 +932,87 @@ func (a *app) postJSON(ctx context.Context, n neighbor, path string, request any
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		message := strings.TrimSpace(string(responseBody))
+		var peerError struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(responseBody, &peerError); err == nil && peerError.Error != "" {
+			message = peerError.Error
+		}
 		if len(message) > 200 {
 			message = message[:200]
 		}
-		if message == "" {
-			return fmt.Errorf("peer returned HTTP %d", resp.StatusCode)
-		}
-		return fmt.Errorf("peer returned HTTP %d: %s", resp.StatusCode, message)
+		return &httpStatusError{StatusCode: resp.StatusCode, Message: message}
 	}
 	return nil
 }
 
-func (a *app) startIperfServer(timeout time.Duration) (int, time.Time, error) {
+func (a *app) getJSON(ctx context.Context, n neighbor, path string, response any) error {
+	requestURL := strings.TrimRight(n.BaseURL, "/") + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return err
+	}
+	if a.cfg.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+a.cfg.Token)
+	}
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if len(responseBody) > 0 && response != nil {
+		if err := json.Unmarshal(responseBody, response); err != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return err
+		}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message := strings.TrimSpace(string(responseBody))
+		var peerError struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(responseBody, &peerError); err == nil && peerError.Error != "" {
+			message = peerError.Error
+		}
+		if len(message) > 200 {
+			message = message[:200]
+		}
+		return &httpStatusError{StatusCode: resp.StatusCode, Message: message}
+	}
+	return nil
+}
+
+func (a *app) peerNodeName(ctx context.Context, n neighbor) (string, error) {
+	a.peerMu.Lock()
+	if name := a.peerNames[n.BaseURL]; name != "" {
+		a.peerMu.Unlock()
+		return name, nil
+	}
+	a.peerMu.Unlock()
+
+	requestCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var info infoResponse
+	if err := a.getJSON(requestCtx, n, "/v1/info", &info); err != nil {
+		return "", err
+	}
+	name := strings.TrimSpace(info.NodeName)
+	if name == "" {
+		return "", fmt.Errorf("peer returned empty node name")
+	}
+
+	a.peerMu.Lock()
+	a.peerNames[n.BaseURL] = name
+	a.peerMu.Unlock()
+	return name, nil
+}
+
+func (a *app) startIperfServer(timeout time.Duration) (int, time.Time, <-chan error, context.CancelFunc, error) {
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
@@ -817,21 +1046,26 @@ func (a *app) startIperfServer(timeout time.Duration) (int, time.Time, error) {
 			cancel()
 			a.releasePort(port)
 			done <- err
+			close(done)
 		}(port)
 
 		select {
 		case err := <-done:
-			lastErr = fmt.Errorf("iperf3 server exited before negotiation completed: %w", err)
+			if err == nil {
+				lastErr = fmt.Errorf("iperf3 server exited before negotiation completed")
+			} else {
+				lastErr = fmt.Errorf("iperf3 server exited before negotiation completed: %w", err)
+			}
 			continue
 		case <-time.After(serverReadyDelay):
-			return port, expiresAt, nil
+			return port, expiresAt, done, cancel, nil
 		}
 	}
 
 	if lastErr != nil {
-		return 0, time.Time{}, lastErr
+		return 0, time.Time{}, nil, nil, lastErr
 	}
-	return 0, time.Time{}, fmt.Errorf("no iperf server ports available")
+	return 0, time.Time{}, nil, nil, fmt.Errorf("no iperf server ports available")
 }
 
 func (a *app) reservePort(port int) bool {

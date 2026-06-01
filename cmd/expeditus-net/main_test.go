@@ -35,6 +35,53 @@ func TestNormalizeNeighborAddsDefaultPort(t *testing.T) {
 	}
 }
 
+func TestParseConfigDefaultsToBothProtocols(t *testing.T) {
+	cfg, err := parseConfig(nil)
+	if err != nil {
+		t.Fatalf("parseConfig returned error: %v", err)
+	}
+	if cfg.Protocol != "both" {
+		t.Fatalf("got protocol %q, want both", cfg.Protocol)
+	}
+	if cfg.Bandwidth != "10M" {
+		t.Fatalf("got bandwidth %q, want 10M", cfg.Bandwidth)
+	}
+	protocols := cfg.probeProtocols()
+	if len(protocols) != 2 || protocols[0] != "udp" || protocols[1] != "tcp" {
+		t.Fatalf("got probe protocols %v, want [udp tcp]", protocols)
+	}
+}
+
+func TestInitiatorOwnsPair(t *testing.T) {
+	if !initiatorOwnsPair("node-a", "node-b") {
+		t.Fatalf("expected node-a to own node-a/node-b")
+	}
+	if initiatorOwnsPair("node-b", "node-a") {
+		t.Fatalf("expected node-b not to own node-a/node-b")
+	}
+	if initiatorOwnsPair("node-a", "node-a") {
+		t.Fatalf("expected matching node names not to own a pair")
+	}
+}
+
+func TestTestSlotAllowsOneActiveTest(t *testing.T) {
+	a := &app{}
+	release, ok := a.tryAcquireTestSlot()
+	if !ok {
+		t.Fatalf("first slot acquire failed")
+	}
+	if _, ok := a.tryAcquireTestSlot(); ok {
+		t.Fatalf("second slot acquire succeeded while active")
+	}
+	release()
+	release()
+	if release, ok := a.tryAcquireTestSlot(); !ok {
+		t.Fatalf("slot acquire failed after release")
+	} else {
+		release()
+	}
+}
+
 func TestParseUDPMeasurement(t *testing.T) {
 	data := []byte(`{
 		"end": {
@@ -79,9 +126,26 @@ func TestMetricsRender(t *testing.T) {
 		LostPackets:            1,
 		LossRatio:              0.01,
 	})
+	store.Record(metricSample{
+		Key: metricKey{
+			LocalNode:  "a",
+			PeerNode:   "b",
+			ClientNode: "a",
+			ServerNode: "b",
+			Protocol:   "tcp",
+		},
+		Success:                true,
+		BandwidthBitsPerSecond: 1000,
+	})
 
 	rendered := store.Render()
 	if !strings.Contains(rendered, `expeditus_iperf_probe_success{local_node="a",peer_node="b",client_node="a",server_node="b",protocol="udp"} 1`) {
 		t.Fatalf("rendered metrics missing success sample:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `expeditus_iperf_probe_success{local_node="a",peer_node="b",client_node="a",server_node="b",protocol="tcp"} 1`) {
+		t.Fatalf("rendered metrics missing tcp success sample:\n%s", rendered)
+	}
+	if strings.Contains(rendered, `expeditus_iperf_jitter_seconds{local_node="a",peer_node="b",client_node="a",server_node="b",protocol="tcp"}`) {
+		t.Fatalf("rendered metrics included tcp jitter sample:\n%s", rendered)
 	}
 }

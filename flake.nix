@@ -148,14 +148,14 @@
             };
 
             protocol = lib.mkOption {
-              type = lib.types.enum [ "udp" "tcp" ];
-              default = "udp";
-              description = "iperf3 protocol. Jitter is only available for UDP.";
+              type = lib.types.enum [ "both" "udp" "tcp" ];
+              default = "both";
+              description = "iperf3 protocol mode. The default runs UDP quality and TCP bandwidth probes sequentially.";
             };
 
             bandwidth = lib.mkOption {
               type = lib.types.str;
-              default = "100M";
+              default = "10M";
               description = "Target UDP bandwidth passed to iperf3.";
             };
 
@@ -193,7 +193,7 @@
             networking.firewall = lib.mkIf cfg.openFirewall {
               allowedTCPPorts = [ cfg.port ];
               allowedTCPPortRanges = [ iperfPortRange ];
-              allowedUDPPortRanges = lib.mkIf (cfg.protocol == "udp") [ iperfPortRange ];
+              allowedUDPPortRanges = lib.mkIf (cfg.protocol != "tcp") [ iperfPortRange ];
             };
           };
         };

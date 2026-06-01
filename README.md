@@ -14,7 +14,7 @@ The daemon serves Prometheus text metrics at `/metrics`:
 - `expeditus_iperf_probe_duration_seconds`
 - `expeditus_iperf_last_run_timestamp_seconds`
 
-Jitter and packet loss are only emitted for UDP probes.
+By default each peer round runs two sequential probes: a UDP quality probe at `10M` for jitter and loss, then a TCP probe for maximum bandwidth. Jitter and packet loss are only emitted for UDP probes.
 
 ## Ports
 
@@ -29,19 +29,22 @@ nix run . -- \
   --node node-a \
   --bind-address 10.0.0.1:9119 \
   --advertise-address 10.0.0.1 \
-  --neighbor 10.0.0.2 \
-  --protocol udp \
-  --bandwidth 100M
+  --neighbor 10.0.0.2
 ```
 
 Run the same daemon on the neighbor with the opposite bind and neighbor addresses.
 
-The default role policy alternates per neighbor. On one round the local node asks the neighbor to start an `iperf3` server and runs the client locally. On the next round the local node starts the server and asks the neighbor to run the client.
+Use `--protocol udp`, `--protocol tcp`, or `--protocol both` to override the default probe mode. `--bandwidth` only controls the UDP target rate and defaults to `10M`.
+
+Only one node initiates probes for each peer pair: the node with the lexicographically smaller node name. That owner alternates roles per neighbor. On one round it asks the neighbor to start an `iperf3` server and runs the client locally. On the next round it starts the server and asks the neighbor to run the client.
+
+Each daemon participates in only one active `iperf3` test at a time. If a peer is already busy, the request is rejected immediately and retried by the scheduler on a later round.
 
 ## Peer API
 
 - `GET /health`
 - `GET /metrics`
+- `GET /v1/info`
 - `POST /v1/negotiate`
 - `POST /v1/iperf/client/run`
 
@@ -66,8 +69,8 @@ Set `--token` or `--token-file` on every node to require a shared bearer token f
             advertiseAddress = "10.0.0.1";
             neighbors = [ "10.0.0.2" ];
             iperfPortRange = "5201-5210";
-            protocol = "udp";
-            bandwidth = "100M";
+            protocol = "both";
+            bandwidth = "10M";
             openFirewall = true;
           };
         }
