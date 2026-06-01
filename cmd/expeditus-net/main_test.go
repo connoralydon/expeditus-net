@@ -139,27 +139,47 @@ func TestIsBusyConflictOnlyMatchesRunningTest409(t *testing.T) {
 	}
 }
 
-func TestAcquireTestSlotWithBusyRetryWaitsForRelease(t *testing.T) {
+func TestAcquirePairLeaseWithBusyRetryWaitsForRelease(t *testing.T) {
 	withBusyRetryTiming(t, 100*time.Millisecond, time.Millisecond)
 	a := &app{}
-	release, ok := a.tryAcquireTestSlot()
+	lease, ok := a.tryAcquirePairLease(time.Second)
 	if !ok {
-		t.Fatalf("initial slot acquire failed")
+		t.Fatalf("initial lease acquire failed")
 	}
 
 	released := make(chan struct{})
 	go func() {
 		time.Sleep(5 * time.Millisecond)
-		release()
+		lease.Release()
 		close(released)
 	}()
 
-	retryRelease, ok := a.acquireTestSlotWithBusyRetry(context.Background())
+	retryLease, ok := a.acquirePairLeaseWithBusyRetry(context.Background(), time.Second)
 	if !ok {
-		t.Fatalf("slot acquire did not retry until release")
+		t.Fatalf("lease acquire did not retry until release")
 	}
-	retryRelease()
+	retryLease.Release()
 	<-released
+}
+
+func TestPairLeaseBlocksTestSlotUntilRelease(t *testing.T) {
+	a := &app{}
+	lease, ok := a.tryAcquirePairLease(time.Second)
+	if !ok {
+		t.Fatalf("lease acquire failed")
+	}
+	if _, ok := a.tryAcquireTestSlot(); ok {
+		t.Fatalf("test slot acquired while pair lease was active")
+	}
+	if !a.hasPairLease(lease.ID) {
+		t.Fatalf("active pair lease was not recognized")
+	}
+	lease.Release()
+	releaseTest, ok := a.tryAcquireTestSlot()
+	if !ok {
+		t.Fatalf("test slot not available after pair lease release")
+	}
+	releaseTest()
 }
 
 func TestPostJSONWithBusyRetryRetriesBusyPeer(t *testing.T) {
@@ -195,33 +215,38 @@ func TestPostJSONWithBusyRetryRetriesBusyPeer(t *testing.T) {
 	}
 }
 
-func TestRunLocalClientProbeRecordsFailureAfterBusyRetry(t *testing.T) {
+func TestRunPeerProbeRecordsFailuresAfterBusyLeaseRetry(t *testing.T) {
 	withBusyRetryTiming(t, 5*time.Millisecond, time.Millisecond)
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/lease/acquire" {
+			t.Fatalf("got path %q, want /v1/lease/acquire", r.URL.Path)
+		}
 		requests.Add(1)
-		writeJSON(w, http.StatusConflict, negotiateResponse{Accepted: false, Error: "node is already running a test"})
+		writeJSON(w, http.StatusConflict, pairLeaseAcquireResponse{Accepted: false, Error: "node is already running a test"})
 	}))
 	defer server.Close()
 
 	a := &app{cfg: &config{NodeName: "a", Bandwidth: "10M"}, client: server.Client(), metrics: newMetricStore()}
-	a.runLocalClientProbe(context.Background(), neighbor{BaseURL: server.URL, Node: "b"}, "b", "tcp", 1)
+	a.runPeerProbe(context.Background(), neighbor{BaseURL: server.URL, Node: "b"}, "b", []string{"udp", "tcp"}, true, 1)
 
 	if requests.Load() < 2 {
 		t.Fatalf("got %d requests, want at least 2", requests.Load())
 	}
-	key := metricKey{LocalNode: "a", PeerNode: "b", ClientNode: "a", ServerNode: "b", Protocol: "tcp"}
-	a.metrics.mu.RLock()
-	sample, ok := a.metrics.samples[key]
-	a.metrics.mu.RUnlock()
-	if !ok {
-		t.Fatalf("missing failed tcp sample")
-	}
-	if sample.Success {
-		t.Fatalf("got successful sample, want failure")
-	}
-	if sample.LastRun.IsZero() {
-		t.Fatalf("failed sample did not update last run timestamp")
+	for _, protocol := range []string{"udp", "tcp"} {
+		key := metricKey{LocalNode: "a", PeerNode: "b", ClientNode: "a", ServerNode: "b", Protocol: protocol}
+		a.metrics.mu.RLock()
+		sample, ok := a.metrics.samples[key]
+		a.metrics.mu.RUnlock()
+		if !ok {
+			t.Fatalf("missing failed %s sample", protocol)
+		}
+		if sample.Success {
+			t.Fatalf("got successful %s sample, want failure", protocol)
+		}
+		if sample.LastRun.IsZero() {
+			t.Fatalf("failed %s sample did not update last run timestamp", protocol)
+		}
 	}
 }
 

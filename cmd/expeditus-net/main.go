@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -26,7 +28,7 @@ import (
 )
 
 const (
-	appVersion            = "v1.0.0"
+	appVersion            = "v1.0.1"
 	defaultBindAddress    = ":9119"
 	defaultIperfPortRange = "5201-5210"
 	defaultProtocol       = "both"
@@ -82,10 +84,12 @@ type app struct {
 	client  *http.Client
 	metrics *metricStore
 
-	activeMu      sync.Mutex
-	activeServers map[int]struct{}
-	testMu        sync.Mutex
-	testActive    bool
+	activeMu       sync.Mutex
+	activeServers  map[int]struct{}
+	testMu         sync.Mutex
+	testActive     bool
+	testLeaseID    string
+	testLeaseTimer *time.Timer
 
 	roleMu     sync.Mutex
 	roleCounts map[string]int
@@ -105,6 +109,7 @@ type infoResponse struct {
 
 type negotiateRequest struct {
 	ClientNode      string `json:"client_node"`
+	LeaseID         string `json:"lease_id,omitempty"`
 	Protocol        string `json:"protocol"`
 	DurationSeconds int    `json:"duration_seconds"`
 	Bandwidth       string `json:"bandwidth"`
@@ -124,6 +129,7 @@ type clientRunRequest struct {
 	ServerNode      string `json:"server_node"`
 	ServerHost      string `json:"server_host"`
 	ServerPort      int    `json:"server_port"`
+	LeaseID         string `json:"lease_id,omitempty"`
 	Protocol        string `json:"protocol"`
 	DurationSeconds int    `json:"duration_seconds"`
 	Bandwidth       string `json:"bandwidth"`
@@ -134,6 +140,33 @@ type clientRunResponse struct {
 	Result   probeResult  `json:"result"`
 	Results  probeResults `json:"results"`
 	Error    string       `json:"error,omitempty"`
+}
+
+type pairLeaseAcquireRequest struct {
+	InitiatorNode  string `json:"initiator_node"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+}
+
+type pairLeaseAcquireResponse struct {
+	Accepted  bool      `json:"accepted"`
+	LeaseID   string    `json:"lease_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Error     string    `json:"error,omitempty"`
+}
+
+type pairLeaseReleaseRequest struct {
+	LeaseID string `json:"lease_id"`
+}
+
+type pairLeaseReleaseResponse struct {
+	Released bool   `json:"released"`
+	Error    string `json:"error,omitempty"`
+}
+
+type pairLease struct {
+	ID        string
+	ExpiresAt time.Time
+	Release   func()
 }
 
 type probeResult struct {
@@ -536,6 +569,8 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("/health", a.handleHealth)
 	mux.HandleFunc("/metrics", a.handleMetrics)
 	mux.HandleFunc("/v1/info", a.handleInfo)
+	mux.HandleFunc("/v1/lease/acquire", a.handlePairLeaseAcquire)
+	mux.HandleFunc("/v1/lease/release", a.handlePairLeaseRelease)
 	mux.HandleFunc("/v1/negotiate", a.handleNegotiate)
 	mux.HandleFunc("/v1/iperf/client/run", a.handleClientRun)
 	return mux
@@ -570,6 +605,64 @@ func (a *app) handleInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, infoResponse{NodeName: a.cfg.NodeName, Version: appVersion})
 }
 
+func (a *app) handlePairLeaseAcquire(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !a.authorize(w, r) {
+		return
+	}
+
+	var req pairLeaseAcquireRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, pairLeaseAcquireResponse{Accepted: false, Error: err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.InitiatorNode) == "" {
+		writeJSON(w, http.StatusBadRequest, pairLeaseAcquireResponse{Accepted: false, Error: "initiator_node is required"})
+		return
+	}
+	if req.TimeoutSeconds < 1 {
+		writeJSON(w, http.StatusBadRequest, pairLeaseAcquireResponse{Accepted: false, Error: "timeout_seconds must be greater than zero"})
+		return
+	}
+	if !initiatorOwnsPair(req.InitiatorNode, a.cfg.NodeName) {
+		writeJSON(w, http.StatusConflict, pairLeaseAcquireResponse{Accepted: false, Error: "peer pair is owned by " + pairOwner(req.InitiatorNode, a.cfg.NodeName)})
+		return
+	}
+
+	lease, ok := a.tryAcquirePairLease(time.Duration(req.TimeoutSeconds) * time.Second)
+	if !ok {
+		writeJSON(w, http.StatusConflict, pairLeaseAcquireResponse{Accepted: false, Error: "node is already running a test"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, pairLeaseAcquireResponse{Accepted: true, LeaseID: lease.ID, ExpiresAt: lease.ExpiresAt.UTC()})
+}
+
+func (a *app) handlePairLeaseRelease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !a.authorize(w, r) {
+		return
+	}
+
+	var req pairLeaseReleaseRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, pairLeaseReleaseResponse{Released: false, Error: err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.LeaseID) == "" {
+		writeJSON(w, http.StatusBadRequest, pairLeaseReleaseResponse{Released: false, Error: "lease_id is required"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, pairLeaseReleaseResponse{Released: a.releasePairLease(req.LeaseID)})
+}
+
 func (a *app) handleNegotiate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -596,19 +689,32 @@ func (a *app) handleNegotiate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, negotiateResponse{Accepted: false, Error: "peer pair is owned by " + pairOwner(req.ClientNode, a.cfg.NodeName)})
 		return
 	}
-	releaseTest, ok := a.tryAcquireTestSlot()
-	if !ok {
-		writeJSON(w, http.StatusConflict, negotiateResponse{Accepted: false, Error: "node is already running a test"})
-		return
+	var releaseTest func()
+	if req.LeaseID != "" {
+		if !a.hasPairLease(req.LeaseID) {
+			writeJSON(w, http.StatusConflict, negotiateResponse{Accepted: false, Error: "pair lease is not active"})
+			return
+		}
+	} else {
+		var ok bool
+		releaseTest, ok = a.tryAcquireTestSlot()
+		if !ok {
+			writeJSON(w, http.StatusConflict, negotiateResponse{Accepted: false, Error: "node is already running a test"})
+			return
+		}
 	}
 
 	port, expiresAt, done, _, err := a.startIperfServer(a.timeoutForSeconds(req.DurationSeconds))
 	if err != nil {
-		releaseTest()
+		if releaseTest != nil {
+			releaseTest()
+		}
 		writeJSON(w, http.StatusServiceUnavailable, negotiateResponse{Accepted: false, Error: err.Error()})
 		return
 	}
-	releaseTestSlotWhenDone(done, releaseTest)
+	if releaseTest != nil {
+		releaseTestSlotWhenDone(done, releaseTest)
+	}
 
 	writeJSON(w, http.StatusOK, negotiateResponse{
 		Accepted:   true,
@@ -650,12 +756,21 @@ func (a *app) handleClientRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, clientRunResponse{Accepted: false, Error: "server_host and valid server_port are required"})
 		return
 	}
-	releaseTest, ok := a.tryAcquireTestSlot()
-	if !ok {
-		writeJSON(w, http.StatusConflict, clientRunResponse{Accepted: false, Error: "node is already running a test"})
-		return
+	var releaseTest func()
+	if req.LeaseID != "" {
+		if !a.hasPairLease(req.LeaseID) {
+			writeJSON(w, http.StatusConflict, clientRunResponse{Accepted: false, Error: "pair lease is not active"})
+			return
+		}
+	} else {
+		var ok bool
+		releaseTest, ok = a.tryAcquireTestSlot()
+		if !ok {
+			writeJSON(w, http.StatusConflict, clientRunResponse{Accepted: false, Error: "node is already running a test"})
+			return
+		}
+		defer releaseTest()
 	}
-	defer releaseTest()
 
 	serverNode := req.ServerNode
 
@@ -798,6 +913,7 @@ func (a *app) runRound(ctx context.Context) {
 		return
 	}
 	durationSeconds := secondsCeil(a.cfg.Duration)
+	protocols := a.cfg.probeProtocols()
 	for _, n := range a.cfg.Neighbors {
 		select {
 		case <-ctx.Done():
@@ -818,18 +934,7 @@ func (a *app) runRound(ctx context.Context) {
 		}
 
 		localClient := a.nextLocalClient(peerName)
-		for _, protocol := range a.cfg.probeProtocols() {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			if localClient {
-				a.runLocalClientProbe(ctx, n, peerName, protocol, durationSeconds)
-			} else {
-				a.runRemoteClientProbe(ctx, n, peerName, protocol, durationSeconds)
-			}
-		}
+		a.runPeerProbe(ctx, n, peerName, protocols, localClient, durationSeconds)
 	}
 }
 
@@ -857,6 +962,64 @@ func (a *app) tryAcquireTestSlot() (func(), bool) {
 		})
 	}
 	return release, true
+}
+
+func (a *app) tryAcquirePairLease(timeout time.Duration) (pairLease, bool) {
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+
+	leaseID := newLeaseID()
+	expiresAt := time.Now().Add(timeout)
+
+	a.testMu.Lock()
+	if a.testActive {
+		a.testMu.Unlock()
+		return pairLease{}, false
+	}
+	a.testActive = true
+	a.testLeaseID = leaseID
+	a.testLeaseTimer = time.AfterFunc(timeout, func() {
+		a.releasePairLease(leaseID)
+	})
+	a.testMu.Unlock()
+
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			a.releasePairLease(leaseID)
+		})
+	}
+	return pairLease{ID: leaseID, ExpiresAt: expiresAt, Release: release}, true
+}
+
+func (a *app) releasePairLease(leaseID string) bool {
+	a.testMu.Lock()
+	defer a.testMu.Unlock()
+	if leaseID == "" || a.testLeaseID != leaseID {
+		return false
+	}
+	if a.testLeaseTimer != nil {
+		a.testLeaseTimer.Stop()
+		a.testLeaseTimer = nil
+	}
+	a.testLeaseID = ""
+	a.testActive = false
+	return true
+}
+
+func (a *app) hasPairLease(leaseID string) bool {
+	a.testMu.Lock()
+	defer a.testMu.Unlock()
+	return leaseID != "" && a.testActive && a.testLeaseID == leaseID
+}
+
+func newLeaseID() string {
+	var data [16]byte
+	if _, err := rand.Read(data[:]); err == nil {
+		return hex.EncodeToString(data[:])
+	}
+	return strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
 func releaseTestSlotWhenDone(done <-chan error, release func()) {
@@ -897,14 +1060,14 @@ func waitForBusyRetry(ctx context.Context, started time.Time) bool {
 	}
 }
 
-func (a *app) acquireTestSlotWithBusyRetry(ctx context.Context) (func(), bool) {
+func (a *app) acquirePairLeaseWithBusyRetry(ctx context.Context, timeout time.Duration) (pairLease, bool) {
 	started := time.Now()
 	for {
-		if release, ok := a.tryAcquireTestSlot(); ok {
-			return release, true
+		if lease, ok := a.tryAcquirePairLease(timeout); ok {
+			return lease, true
 		}
 		if !waitForBusyRetry(ctx, started) {
-			return nil, false
+			return pairLease{}, false
 		}
 	}
 }
@@ -922,21 +1085,96 @@ func (a *app) postJSONWithBusyRetry(ctx context.Context, n neighbor, path string
 	}
 }
 
-func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, peerName string, protocol string, durationSeconds int) {
+func (a *app) runPeerProbe(ctx context.Context, n neighbor, peerName string, protocols []string, localClient bool, durationSeconds int) {
 	started := time.Now()
-	releaseTest, ok := a.acquireTestSlotWithBusyRetry(ctx)
+	leaseTimeout := a.pairLeaseTimeout(protocols, durationSeconds)
+	localLease, ok := a.acquirePairLeaseWithBusyRetry(ctx, leaseTimeout)
 	if !ok {
-		log.Printf("probe failed peer=%s protocol=%s: node is already running a test", peerName, protocol)
-		a.recordFailure(peerName, a.cfg.NodeName, peerName, protocol, time.Since(started))
+		log.Printf("probe lease failed peer=%s: node is already running a test", peerName)
+		a.recordProbeSequenceFailure(peerName, localClient, protocols, time.Since(started))
 		return
 	}
-	defer releaseTest()
+	defer localLease.Release()
+
+	peerLeaseID, err := a.acquirePeerPairLease(ctx, n, leaseTimeout)
+	if err != nil {
+		log.Printf("probe lease failed peer=%s: %v", peerName, err)
+		a.recordProbeSequenceFailure(peerName, localClient, protocols, time.Since(started))
+		return
+	}
+	defer a.releasePeerPairLease(n, peerLeaseID)
+
+	for _, protocol := range protocols {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if localClient {
+			a.runLocalClientProbe(ctx, n, peerName, peerLeaseID, protocol, durationSeconds)
+		} else {
+			a.runRemoteClientProbe(ctx, n, peerName, peerLeaseID, protocol, durationSeconds)
+		}
+	}
+}
+
+func (a *app) pairLeaseTimeout(protocols []string, durationSeconds int) time.Duration {
+	perProbe := a.timeoutForSeconds(durationSeconds) + 5*time.Second
+	return time.Duration(len(protocols))*perProbe + 5*time.Second
+}
+
+func (a *app) acquirePeerPairLease(ctx context.Context, n neighbor, timeout time.Duration) (string, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, busyRetryTimeout+5*time.Second)
+	defer cancel()
+
+	var resp pairLeaseAcquireResponse
+	err := a.postJSONWithBusyRetry(requestCtx, n, "/v1/lease/acquire", pairLeaseAcquireRequest{
+		InitiatorNode:  a.cfg.NodeName,
+		TimeoutSeconds: secondsCeil(timeout),
+	}, &resp)
+	if err != nil {
+		return "", err
+	}
+	if !resp.Accepted {
+		return "", errors.New(resp.Error)
+	}
+	if resp.LeaseID == "" {
+		return "", errors.New("peer returned empty lease_id")
+	}
+	return resp.LeaseID, nil
+}
+
+func (a *app) releasePeerPairLease(n neighbor, leaseID string) {
+	if leaseID == "" {
+		return
+	}
+	releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var resp pairLeaseReleaseResponse
+	if err := a.postJSON(releaseCtx, n, "/v1/lease/release", pairLeaseReleaseRequest{LeaseID: leaseID}, &resp); err != nil {
+		log.Printf("peer lease release failed peer=%s: %v", n.Node, err)
+	}
+}
+
+func (a *app) recordProbeSequenceFailure(peerName string, localClient bool, protocols []string, duration time.Duration) {
+	for _, protocol := range protocols {
+		if localClient {
+			a.recordFailure(peerName, a.cfg.NodeName, peerName, protocol, duration)
+		} else {
+			a.recordFailure(peerName, peerName, a.cfg.NodeName, protocol, duration)
+		}
+	}
+}
+
+func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, peerName string, peerLeaseID string, protocol string, durationSeconds int) {
+	started := time.Now()
 
 	var resp negotiateResponse
 	requestCtx, cancel := context.WithTimeout(ctx, a.timeoutForSeconds(durationSeconds)+5*time.Second)
 	defer cancel()
-	err := a.postJSONWithBusyRetry(requestCtx, n, "/v1/negotiate", negotiateRequest{
+	err := a.postJSON(requestCtx, n, "/v1/negotiate", negotiateRequest{
 		ClientNode:      a.cfg.NodeName,
+		LeaseID:         peerLeaseID,
 		Protocol:        protocol,
 		DurationSeconds: durationSeconds,
 		Bandwidth:       a.cfg.Bandwidth,
@@ -970,37 +1208,31 @@ func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, peerName stri
 	}
 }
 
-func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, peerName string, protocol string, durationSeconds int) {
+func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, peerName string, peerLeaseID string, protocol string, durationSeconds int) {
 	started := time.Now()
-	releaseTest, ok := a.acquireTestSlotWithBusyRetry(ctx)
-	if !ok {
-		log.Printf("probe failed peer=%s protocol=%s: node is already running a test", peerName, protocol)
-		a.recordFailure(peerName, peerName, a.cfg.NodeName, protocol, time.Since(started))
-		return
-	}
 
 	port, _, done, stopServer, err := a.startIperfServer(a.timeoutForSeconds(durationSeconds))
 	if err != nil {
-		releaseTest()
 		log.Printf("local iperf server failed peer=%s: %v", peerName, err)
 		a.recordFailure(peerName, peerName, a.cfg.NodeName, protocol, time.Since(started))
 		return
 	}
-	releaseTestSlotWhenDone(done, releaseTest)
 
 	var resp clientRunResponse
 	requestCtx, cancel := context.WithTimeout(ctx, a.timeoutForSeconds(durationSeconds)+5*time.Second)
 	defer cancel()
-	err = a.postJSONWithBusyRetry(requestCtx, n, "/v1/iperf/client/run", clientRunRequest{
+	err = a.postJSON(requestCtx, n, "/v1/iperf/client/run", clientRunRequest{
 		ServerNode:      a.cfg.NodeName,
 		ServerHost:      a.cfg.AdvertiseAddress,
 		ServerPort:      port,
+		LeaseID:         peerLeaseID,
 		Protocol:        protocol,
 		DurationSeconds: durationSeconds,
 		Bandwidth:       a.cfg.Bandwidth,
 	}, &resp)
 	if err != nil || !resp.Accepted {
 		stopServer()
+		waitForIperfServerDone(done)
 		if err == nil {
 			err = errors.New(resp.Error)
 		}
@@ -1014,11 +1246,19 @@ func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, peerName str
 		return
 	}
 	results := resp.probeResults()
+	waitForIperfServerDone(done)
 	if results.success() {
 		log.Printf("probe succeeded peer=%s protocol=%s role=server client_to_server_bandwidth_bps=%.0f server_to_client_bandwidth_bps=%.0f client_to_server_jitter_s=%.6f server_to_client_jitter_s=%.6f", peerName, protocol, results.ClientToServer.BandwidthBitsPerSecond, results.ServerToClient.BandwidthBitsPerSecond, results.ClientToServer.JitterSeconds, results.ServerToClient.JitterSeconds)
 	} else {
 		log.Printf("probe failed peer=%s protocol=%s role=server: %s", peerName, protocol, results.errorMessage())
 	}
+}
+
+func waitForIperfServerDone(done <-chan error) {
+	if done == nil {
+		return
+	}
+	<-done
 }
 
 func (a *app) recordFailure(peerNode string, clientNode string, serverNode string, protocol string, duration time.Duration) {

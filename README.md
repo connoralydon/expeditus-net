@@ -14,7 +14,7 @@ The daemon serves Prometheus text metrics at `/metrics`:
 - `expeditus_iperf_probe_duration_seconds`
 - `expeditus_iperf_last_run_timestamp_seconds`
 
-By default each peer round runs two sequential bidirectional probes with `iperf3 --bidir`: a UDP quality probe at `10M` for jitter and loss, then a TCP probe for maximum bandwidth. Each probe emits samples for both `client_node`/`server_node` directions. Jitter and packet loss are only emitted for UDP probes.
+By default each peer round acquires a pair lease, then runs two sequential bidirectional probes with `iperf3 --bidir`: a UDP quality probe at `10M` for jitter and loss, then a TCP probe for maximum bandwidth. Each probe emits samples for both `client_node`/`server_node` directions. Jitter and packet loss are only emitted for UDP probes.
 
 ## Ports
 
@@ -38,13 +38,15 @@ Use `--protocol udp`, `--protocol tcp`, or `--protocol both` to override the def
 
 Only one node initiates probes for each peer pair: the node with the lexicographically smaller node name. That owner alternates roles per neighbor. On one round it asks the neighbor to start an `iperf3` server and runs the client locally. On the next round it starts the server and asks the neighbor to run the client.
 
-Each daemon participates in only one active `iperf3` test at a time. If a peer is already busy, the request is rejected immediately and retried by the scheduler on a later round.
+Each daemon participates in only one active peer lease at a time. A lease covers the full protocol sequence for a peer round, so `--protocol both` runs UDP and TCP without releasing/reacquiring busy state between protocols. If a peer is already busy, the lease request is retried briefly within the same round before per-protocol failures are recorded.
 
 ## Peer API
 
 - `GET /health`
 - `GET /metrics`
 - `GET /v1/info`
+- `POST /v1/lease/acquire`
+- `POST /v1/lease/release`
 - `POST /v1/negotiate`
 - `POST /v1/iperf/client/run`
 
