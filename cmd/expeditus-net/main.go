@@ -26,6 +26,7 @@ import (
 )
 
 const (
+	appVersion            = "v1.0.0"
 	defaultBindAddress    = ":9119"
 	defaultIperfPortRange = "5201-5210"
 	defaultProtocol       = "both"
@@ -82,11 +83,12 @@ type app struct {
 	roleCounts map[string]int
 
 	peerMu    sync.Mutex
-	peerNames map[string]string
+	peerInfos map[string]infoResponse
 }
 
 type infoResponse struct {
 	NodeName string `json:"node_name"`
+	Version  string `json:"version"`
 }
 
 type negotiateRequest struct {
@@ -185,7 +187,7 @@ func main() {
 		metrics:       newMetricStore(),
 		activeServers: make(map[int]struct{}),
 		roleCounts:    make(map[string]int),
-		peerNames:     make(map[string]string),
+		peerInfos:     make(map[string]infoResponse),
 	}
 
 	server := &http.Server{
@@ -501,7 +503,7 @@ func (a *app) handleInfo(w http.ResponseWriter, r *http.Request) {
 	if !a.authorize(w, r) {
 		return
 	}
-	writeJSON(w, http.StatusOK, infoResponse{NodeName: a.cfg.NodeName})
+	writeJSON(w, http.StatusOK, infoResponse{NodeName: a.cfg.NodeName, Version: appVersion})
 }
 
 func (a *app) handleNegotiate(w http.ResponseWriter, r *http.Request) {
@@ -989,9 +991,9 @@ func (a *app) getJSON(ctx context.Context, n neighbor, path string, response any
 
 func (a *app) peerNodeName(ctx context.Context, n neighbor) (string, error) {
 	a.peerMu.Lock()
-	if name := a.peerNames[n.BaseURL]; name != "" {
+	if info := a.peerInfos[n.BaseURL]; info.NodeName != "" {
 		a.peerMu.Unlock()
-		return name, nil
+		return info.NodeName, nil
 	}
 	a.peerMu.Unlock()
 
@@ -1005,9 +1007,18 @@ func (a *app) peerNodeName(ctx context.Context, n neighbor) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("peer returned empty node name")
 	}
+	info.NodeName = name
+	info.Version = strings.TrimSpace(info.Version)
+	if info.Version != appVersion {
+		peerVersion := info.Version
+		if peerVersion == "" {
+			peerVersion = "unknown"
+		}
+		log.Printf("warning: peer version mismatch peer=%s node=%s local_version=%s peer_version=%s", n.Node, name, appVersion, peerVersion)
+	}
 
 	a.peerMu.Lock()
-	a.peerNames[n.BaseURL] = name
+	a.peerInfos[n.BaseURL] = info
 	a.peerMu.Unlock()
 	return name, nil
 }
@@ -1232,7 +1243,7 @@ func (m *metricStore) Render() string {
 	var b strings.Builder
 	b.WriteString("# HELP expeditus_iperf_probe_success Whether the last iperf probe completed successfully.\n")
 	b.WriteString("# TYPE expeditus_iperf_probe_success gauge\n")
-	b.WriteString("# HELP expeditus_iperf_bandwidth_bits_per_second Measured iperf bandwidth in bits per second.\n")
+	b.WriteString("# HELP expeditus_iperf_bandwidth_bits_per_second Measured uncapped TCP iperf bandwidth in bits per second.\n")
 	b.WriteString("# TYPE expeditus_iperf_bandwidth_bits_per_second gauge\n")
 	b.WriteString("# HELP expeditus_iperf_jitter_seconds Measured UDP jitter in seconds.\n")
 	b.WriteString("# TYPE expeditus_iperf_jitter_seconds gauge\n")
@@ -1260,8 +1271,9 @@ func (m *metricStore) Render() string {
 			success = 1
 		}
 		fmt.Fprintf(&b, "expeditus_iperf_probe_success{%s} %d\n", labels, success)
-		fmt.Fprintf(&b, "expeditus_iperf_bandwidth_bits_per_second{%s} %g\n", labels, sample.BandwidthBitsPerSecond)
-		if sample.Key.Protocol == "udp" {
+		if sample.Key.Protocol == "tcp" {
+			fmt.Fprintf(&b, "expeditus_iperf_bandwidth_bits_per_second{%s} %g\n", labels, sample.BandwidthBitsPerSecond)
+		} else if sample.Key.Protocol == "udp" {
 			fmt.Fprintf(&b, "expeditus_iperf_jitter_seconds{%s} %g\n", labels, sample.JitterSeconds)
 			fmt.Fprintf(&b, "expeditus_iperf_lost_packets{%s} %g\n", labels, sample.LostPackets)
 			fmt.Fprintf(&b, "expeditus_iperf_loss_ratio{%s} %g\n", labels, sample.LossRatio)

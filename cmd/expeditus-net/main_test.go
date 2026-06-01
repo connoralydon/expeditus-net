@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -61,6 +64,28 @@ func TestInitiatorOwnsPair(t *testing.T) {
 	}
 	if initiatorOwnsPair("node-a", "node-a") {
 		t.Fatalf("expected matching node names not to own a pair")
+	}
+}
+
+func TestHandleInfoPublishesVersion(t *testing.T) {
+	a := &app{cfg: &config{NodeName: "node-a"}}
+	req := httptest.NewRequest(http.MethodGet, "/v1/info", nil)
+	rec := httptest.NewRecorder()
+
+	a.handleInfo(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got status %d, want %d", rec.Code, http.StatusOK)
+	}
+	var info infoResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &info); err != nil {
+		t.Fatalf("decode info response: %v", err)
+	}
+	if info.NodeName != "node-a" {
+		t.Fatalf("got node name %q, want node-a", info.NodeName)
+	}
+	if info.Version != appVersion {
+		t.Fatalf("got version %q, want %q", info.Version, appVersion)
 	}
 }
 
@@ -144,6 +169,12 @@ func TestMetricsRender(t *testing.T) {
 	}
 	if !strings.Contains(rendered, `expeditus_iperf_probe_success{local_node="a",peer_node="b",client_node="a",server_node="b",protocol="tcp"} 1`) {
 		t.Fatalf("rendered metrics missing tcp success sample:\n%s", rendered)
+	}
+	if strings.Contains(rendered, `expeditus_iperf_bandwidth_bits_per_second{local_node="a",peer_node="b",client_node="a",server_node="b",protocol="udp"}`) {
+		t.Fatalf("rendered metrics included udp bandwidth sample:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `expeditus_iperf_bandwidth_bits_per_second{local_node="a",peer_node="b",client_node="a",server_node="b",protocol="tcp"} 1000`) {
+		t.Fatalf("rendered metrics missing tcp bandwidth sample:\n%s", rendered)
 	}
 	if strings.Contains(rendered, `expeditus_iperf_jitter_seconds{local_node="a",peer_node="b",client_node="a",server_node="b",protocol="tcp"}`) {
 		t.Fatalf("rendered metrics included tcp jitter sample:\n%s", rendered)
