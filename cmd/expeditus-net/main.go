@@ -39,6 +39,11 @@ const (
 	activityCheckInterval = time.Minute
 )
 
+var (
+	busyRetryTimeout = 5 * time.Second
+	busyRetryBackoff = 250 * time.Millisecond
+)
+
 type stringList []string
 
 func (s *stringList) String() string {
@@ -861,16 +866,68 @@ func releaseTestSlotWhenDone(done <-chan error, release func()) {
 	}()
 }
 
-func isPeerConflict(err error) bool {
+func isBusyConflict(err error) bool {
 	var statusErr *httpStatusError
-	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusConflict
+	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusConflict && strings.Contains(strings.ToLower(statusErr.Message), "already running a test")
+}
+
+func waitForBusyRetry(ctx context.Context, started time.Time) bool {
+	if busyRetryTimeout <= 0 {
+		return false
+	}
+	remaining := busyRetryTimeout - time.Since(started)
+	if remaining <= 0 {
+		return false
+	}
+	backoff := busyRetryBackoff
+	if backoff <= 0 {
+		backoff = time.Millisecond
+	}
+	if backoff > remaining {
+		backoff = remaining
+	}
+
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (a *app) acquireTestSlotWithBusyRetry(ctx context.Context) (func(), bool) {
+	started := time.Now()
+	for {
+		if release, ok := a.tryAcquireTestSlot(); ok {
+			return release, true
+		}
+		if !waitForBusyRetry(ctx, started) {
+			return nil, false
+		}
+	}
+}
+
+func (a *app) postJSONWithBusyRetry(ctx context.Context, n neighbor, path string, request any, response any) error {
+	started := time.Now()
+	for {
+		err := a.postJSON(ctx, n, path, request, response)
+		if !isBusyConflict(err) {
+			return err
+		}
+		if !waitForBusyRetry(ctx, started) {
+			return err
+		}
+	}
 }
 
 func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, peerName string, protocol string, durationSeconds int) {
 	started := time.Now()
-	releaseTest, ok := a.tryAcquireTestSlot()
+	releaseTest, ok := a.acquireTestSlotWithBusyRetry(ctx)
 	if !ok {
-		log.Printf("probe skipped peer=%s: node is already running a test", peerName)
+		log.Printf("probe failed peer=%s protocol=%s: node is already running a test", peerName, protocol)
+		a.recordFailure(peerName, a.cfg.NodeName, peerName, protocol, time.Since(started))
 		return
 	}
 	defer releaseTest()
@@ -878,7 +935,7 @@ func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, peerName stri
 	var resp negotiateResponse
 	requestCtx, cancel := context.WithTimeout(ctx, a.timeoutForSeconds(durationSeconds)+5*time.Second)
 	defer cancel()
-	err := a.postJSON(requestCtx, n, "/v1/negotiate", negotiateRequest{
+	err := a.postJSONWithBusyRetry(requestCtx, n, "/v1/negotiate", negotiateRequest{
 		ClientNode:      a.cfg.NodeName,
 		Protocol:        protocol,
 		DurationSeconds: durationSeconds,
@@ -888,8 +945,9 @@ func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, peerName stri
 		if err == nil {
 			err = errors.New(resp.Error)
 		}
-		if isPeerConflict(err) {
-			log.Printf("probe skipped peer=%s: %v", peerName, err)
+		if isBusyConflict(err) {
+			log.Printf("probe failed peer=%s protocol=%s: %v", peerName, protocol, err)
+			a.recordFailure(peerName, a.cfg.NodeName, peerName, protocol, time.Since(started))
 			return
 		}
 		log.Printf("probe negotiation failed peer=%s: %v", peerName, err)
@@ -914,9 +972,10 @@ func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, peerName stri
 
 func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, peerName string, protocol string, durationSeconds int) {
 	started := time.Now()
-	releaseTest, ok := a.tryAcquireTestSlot()
+	releaseTest, ok := a.acquireTestSlotWithBusyRetry(ctx)
 	if !ok {
-		log.Printf("probe skipped peer=%s: node is already running a test", peerName)
+		log.Printf("probe failed peer=%s protocol=%s: node is already running a test", peerName, protocol)
+		a.recordFailure(peerName, peerName, a.cfg.NodeName, protocol, time.Since(started))
 		return
 	}
 
@@ -932,7 +991,7 @@ func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, peerName str
 	var resp clientRunResponse
 	requestCtx, cancel := context.WithTimeout(ctx, a.timeoutForSeconds(durationSeconds)+5*time.Second)
 	defer cancel()
-	err = a.postJSON(requestCtx, n, "/v1/iperf/client/run", clientRunRequest{
+	err = a.postJSONWithBusyRetry(requestCtx, n, "/v1/iperf/client/run", clientRunRequest{
 		ServerNode:      a.cfg.NodeName,
 		ServerHost:      a.cfg.AdvertiseAddress,
 		ServerPort:      port,
@@ -945,8 +1004,9 @@ func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, peerName str
 		if err == nil {
 			err = errors.New(resp.Error)
 		}
-		if isPeerConflict(err) {
-			log.Printf("probe skipped peer=%s: %v", peerName, err)
+		if isBusyConflict(err) {
+			log.Printf("probe failed peer=%s protocol=%s: %v", peerName, protocol, err)
+			a.recordFailure(peerName, peerName, a.cfg.NodeName, protocol, time.Since(started))
 			return
 		}
 		log.Printf("remote client probe failed peer=%s: %v", peerName, err)

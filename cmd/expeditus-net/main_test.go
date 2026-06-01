@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -105,6 +107,121 @@ func TestTestSlotAllowsOneActiveTest(t *testing.T) {
 		t.Fatalf("slot acquire failed after release")
 	} else {
 		release()
+	}
+}
+
+func withBusyRetryTiming(t *testing.T, timeout time.Duration, backoff time.Duration) {
+	t.Helper()
+	oldTimeout := busyRetryTimeout
+	oldBackoff := busyRetryBackoff
+	busyRetryTimeout = timeout
+	busyRetryBackoff = backoff
+	t.Cleanup(func() {
+		busyRetryTimeout = oldTimeout
+		busyRetryBackoff = oldBackoff
+	})
+}
+
+func TestIsBusyConflictOnlyMatchesRunningTest409(t *testing.T) {
+	busyErr := &httpStatusError{StatusCode: http.StatusConflict, Message: "node is already running a test"}
+	if !isBusyConflict(busyErr) {
+		t.Fatalf("expected busy 409 to be retryable")
+	}
+
+	pairOwnerErr := &httpStatusError{StatusCode: http.StatusConflict, Message: "peer pair is owned by a"}
+	if isBusyConflict(pairOwnerErr) {
+		t.Fatalf("expected non-busy 409 not to be retryable")
+	}
+
+	serverErr := &httpStatusError{StatusCode: http.StatusServiceUnavailable, Message: "node is already running a test"}
+	if isBusyConflict(serverErr) {
+		t.Fatalf("expected non-409 busy message not to be retryable")
+	}
+}
+
+func TestAcquireTestSlotWithBusyRetryWaitsForRelease(t *testing.T) {
+	withBusyRetryTiming(t, 100*time.Millisecond, time.Millisecond)
+	a := &app{}
+	release, ok := a.tryAcquireTestSlot()
+	if !ok {
+		t.Fatalf("initial slot acquire failed")
+	}
+
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		release()
+		close(released)
+	}()
+
+	retryRelease, ok := a.acquireTestSlotWithBusyRetry(context.Background())
+	if !ok {
+		t.Fatalf("slot acquire did not retry until release")
+	}
+	retryRelease()
+	<-released
+}
+
+func TestPostJSONWithBusyRetryRetriesBusyPeer(t *testing.T) {
+	withBusyRetryTiming(t, 100*time.Millisecond, time.Millisecond)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/negotiate" {
+			t.Fatalf("got path %q, want /v1/negotiate", r.URL.Path)
+		}
+		if requests.Add(1) == 1 {
+			writeJSON(w, http.StatusConflict, negotiateResponse{Accepted: false, Error: "node is already running a test"})
+			return
+		}
+		writeJSON(w, http.StatusOK, negotiateResponse{Accepted: true, ServerNode: "b"})
+	}))
+	defer server.Close()
+
+	a := &app{cfg: &config{NodeName: "a"}, client: server.Client()}
+	var resp negotiateResponse
+	err := a.postJSONWithBusyRetry(context.Background(), neighbor{BaseURL: server.URL, Node: "b"}, "/v1/negotiate", negotiateRequest{
+		ClientNode:      "a",
+		Protocol:        "tcp",
+		DurationSeconds: 1,
+	}, &resp)
+	if err != nil {
+		t.Fatalf("postJSONWithBusyRetry returned error: %v", err)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("got %d requests, want 2", requests.Load())
+	}
+	if !resp.Accepted {
+		t.Fatalf("response was not accepted")
+	}
+}
+
+func TestRunLocalClientProbeRecordsFailureAfterBusyRetry(t *testing.T) {
+	withBusyRetryTiming(t, 5*time.Millisecond, time.Millisecond)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		writeJSON(w, http.StatusConflict, negotiateResponse{Accepted: false, Error: "node is already running a test"})
+	}))
+	defer server.Close()
+
+	a := &app{cfg: &config{NodeName: "a", Bandwidth: "10M"}, client: server.Client(), metrics: newMetricStore()}
+	a.runLocalClientProbe(context.Background(), neighbor{BaseURL: server.URL, Node: "b"}, "b", "tcp", 1)
+
+	if requests.Load() < 2 {
+		t.Fatalf("got %d requests, want at least 2", requests.Load())
+	}
+	key := metricKey{LocalNode: "a", PeerNode: "b", ClientNode: "a", ServerNode: "b", Protocol: "tcp"}
+	a.metrics.mu.RLock()
+	sample, ok := a.metrics.samples[key]
+	a.metrics.mu.RUnlock()
+	if !ok {
+		t.Fatalf("missing failed tcp sample")
+	}
+	if sample.Success {
+		t.Fatalf("got successful sample, want failure")
+	}
+	if sample.LastRun.IsZero() {
+		t.Fatalf("failed sample did not update last run timestamp")
 	}
 }
 
