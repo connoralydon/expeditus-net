@@ -34,6 +34,9 @@ const (
 	defaultInterval       = 60 * time.Second
 	defaultDuration       = 5 * time.Second
 	serverReadyDelay      = 150 * time.Millisecond
+	activityWarningAfter  = 20 * time.Minute
+	activityRestartAfter  = time.Hour
+	activityCheckInterval = time.Minute
 )
 
 type stringList []string
@@ -84,6 +87,10 @@ type app struct {
 
 	peerMu    sync.Mutex
 	peerInfos map[string]infoResponse
+
+	activityMu        sync.Mutex
+	lastActivity      time.Time
+	idleWarningLogged bool
 }
 
 type infoResponse struct {
@@ -118,9 +125,10 @@ type clientRunRequest struct {
 }
 
 type clientRunResponse struct {
-	Accepted bool        `json:"accepted"`
-	Result   probeResult `json:"result"`
-	Error    string      `json:"error,omitempty"`
+	Accepted bool         `json:"accepted"`
+	Result   probeResult  `json:"result"`
+	Results  probeResults `json:"results"`
+	Error    string       `json:"error,omitempty"`
 }
 
 type probeResult struct {
@@ -131,6 +139,37 @@ type probeResult struct {
 	LossRatio              float64 `json:"loss_ratio"`
 	DurationSeconds        float64 `json:"duration_seconds"`
 	Error                  string  `json:"error,omitempty"`
+}
+
+type probeResults struct {
+	ClientToServer probeResult `json:"client_to_server"`
+	ServerToClient probeResult `json:"server_to_client"`
+}
+
+func (r probeResult) hasData() bool {
+	return r.Success || r.BandwidthBitsPerSecond != 0 || r.JitterSeconds != 0 || r.LostPackets != 0 || r.LossRatio != 0 || r.DurationSeconds != 0 || r.Error != ""
+}
+
+func (r probeResults) hasData() bool {
+	return r.ClientToServer.hasData() || r.ServerToClient.hasData()
+}
+
+func (r probeResults) success() bool {
+	return r.ClientToServer.Success && r.ServerToClient.Success
+}
+
+func (r clientRunResponse) probeResults() probeResults {
+	if r.Results.hasData() {
+		return r.Results
+	}
+	return probeResults{ClientToServer: r.Result, ServerToClient: r.Result}
+}
+
+func (r probeResults) errorMessage() string {
+	if r.ClientToServer.Error != "" {
+		return r.ClientToServer.Error
+	}
+	return r.ServerToClient.Error
 }
 
 type metricKey struct {
@@ -162,11 +201,19 @@ type httpStatusError struct {
 	Message    string
 }
 
+type activityIdleError struct {
+	IdleFor time.Duration
+}
+
 func (e *httpStatusError) Error() string {
 	if e.Message == "" {
 		return fmt.Sprintf("peer returned HTTP %d", e.StatusCode)
 	}
 	return fmt.Sprintf("peer returned HTTP %d: %s", e.StatusCode, e.Message)
+}
+
+func (e *activityIdleError) Error() string {
+	return fmt.Sprintf("no probe activity for %s", e.IdleFor.Truncate(time.Second))
 }
 
 func main() {
@@ -188,6 +235,7 @@ func main() {
 		activeServers: make(map[int]struct{}),
 		roleCounts:    make(map[string]int),
 		peerInfos:     make(map[string]infoResponse),
+		lastActivity:  time.Now(),
 	}
 
 	server := &http.Server{
@@ -196,7 +244,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		log.Printf("listening on %s as node %q", cfg.BindAddress, cfg.NodeName)
 		errCh <- server.ListenAndServe()
@@ -213,6 +261,7 @@ func main() {
 	}
 
 	go a.runScheduler(ctx)
+	go a.runActivityWatchdog(ctx, errCh)
 
 	select {
 	case <-ctx.Done():
@@ -222,6 +271,16 @@ func main() {
 			log.Printf("http shutdown failed: %v", err)
 		}
 	case err := <-errCh:
+		var idleErr *activityIdleError
+		if errors.As(err, &idleErr) {
+			log.Printf("error: %v; exiting for restart", idleErr)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				log.Printf("http shutdown failed: %v", err)
+			}
+			cancel()
+			os.Exit(1)
+		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http server failed: %v", err)
 		}
@@ -595,25 +654,10 @@ func (a *app) handleClientRun(w http.ResponseWriter, r *http.Request) {
 
 	serverNode := req.ServerNode
 
-	result := a.runIperfClient(r.Context(), req.ServerHost, req.ServerPort, req.Protocol, req.Bandwidth, req.DurationSeconds)
-	a.metrics.Record(metricSample{
-		Key: metricKey{
-			LocalNode:  a.cfg.NodeName,
-			PeerNode:   serverNode,
-			ClientNode: a.cfg.NodeName,
-			ServerNode: serverNode,
-			Protocol:   req.Protocol,
-		},
-		Success:                result.Success,
-		BandwidthBitsPerSecond: result.BandwidthBitsPerSecond,
-		JitterSeconds:          result.JitterSeconds,
-		LostPackets:            result.LostPackets,
-		LossRatio:              result.LossRatio,
-		ProbeDurationSeconds:   result.DurationSeconds,
-		LastRun:                time.Now(),
-	})
+	results := a.runIperfClient(r.Context(), req.ServerHost, req.ServerPort, req.Protocol, req.Bandwidth, req.DurationSeconds)
+	a.recordResultSamples(serverNode, a.cfg.NodeName, serverNode, req.Protocol, results)
 
-	writeJSON(w, http.StatusOK, clientRunResponse{Accepted: true, Result: result})
+	writeJSON(w, http.StatusOK, clientRunResponse{Accepted: true, Result: results.ClientToServer, Results: results})
 }
 
 func (a *app) authorize(w http.ResponseWriter, r *http.Request) bool {
@@ -693,6 +737,55 @@ func (a *app) runScheduler(ctx context.Context) {
 			a.runRound(ctx)
 		}
 	}
+}
+
+func (a *app) runActivityWatchdog(ctx context.Context, errCh chan<- error) {
+	ticker := time.NewTicker(activityCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			idleFor, warn, restart := a.checkIdleActivity(now)
+			if restart {
+				errCh <- &activityIdleError{IdleFor: idleFor}
+				return
+			}
+			if warn {
+				log.Printf("warning: no probe activity for %s", idleFor.Truncate(time.Second))
+			}
+		}
+	}
+}
+
+func (a *app) checkIdleActivity(now time.Time) (time.Duration, bool, bool) {
+	a.activityMu.Lock()
+	defer a.activityMu.Unlock()
+
+	if a.lastActivity.IsZero() {
+		a.lastActivity = now
+	}
+	idleFor := now.Sub(a.lastActivity)
+	if idleFor < 0 {
+		idleFor = 0
+	}
+	if idleFor >= activityRestartAfter {
+		return idleFor, false, true
+	}
+	if idleFor >= activityWarningAfter && !a.idleWarningLogged {
+		a.idleWarningLogged = true
+		return idleFor, true, false
+	}
+	return idleFor, false, false
+}
+
+func (a *app) recordActivity(now time.Time) {
+	a.activityMu.Lock()
+	defer a.activityMu.Unlock()
+	a.lastActivity = now
+	a.idleWarningLogged = false
 }
 
 func (a *app) runRound(ctx context.Context) {
@@ -809,13 +902,13 @@ func (a *app) runLocalClientProbe(ctx context.Context, n neighbor, peerName stri
 		serverNode = peerName
 	}
 	serverHost := usableServerHost(resp.ServerHost, n.Node)
-	result := a.runIperfClient(ctx, serverHost, resp.ServerPort, protocol, a.cfg.Bandwidth, durationSeconds)
-	a.metrics.Record(sampleFromResult(a.cfg.NodeName, serverNode, a.cfg.NodeName, serverNode, protocol, result))
+	results := a.runIperfClient(ctx, serverHost, resp.ServerPort, protocol, a.cfg.Bandwidth, durationSeconds)
+	a.recordResultSamples(peerName, a.cfg.NodeName, serverNode, protocol, results)
 
-	if result.Success {
-		log.Printf("probe succeeded peer=%s protocol=%s role=client bandwidth_bps=%.0f jitter_s=%.6f", peerName, protocol, result.BandwidthBitsPerSecond, result.JitterSeconds)
+	if results.success() {
+		log.Printf("probe succeeded peer=%s protocol=%s role=client client_to_server_bandwidth_bps=%.0f server_to_client_bandwidth_bps=%.0f client_to_server_jitter_s=%.6f server_to_client_jitter_s=%.6f", peerName, protocol, results.ClientToServer.BandwidthBitsPerSecond, results.ServerToClient.BandwidthBitsPerSecond, results.ClientToServer.JitterSeconds, results.ServerToClient.JitterSeconds)
 	} else {
-		log.Printf("probe failed peer=%s protocol=%s role=client: %s", peerName, protocol, result.Error)
+		log.Printf("probe failed peer=%s protocol=%s role=client: %s", peerName, protocol, results.errorMessage())
 	}
 }
 
@@ -860,26 +953,22 @@ func (a *app) runRemoteClientProbe(ctx context.Context, n neighbor, peerName str
 		a.recordFailure(peerName, peerName, a.cfg.NodeName, protocol, time.Since(started))
 		return
 	}
-	if resp.Result.Success {
-		log.Printf("probe succeeded peer=%s protocol=%s role=server bandwidth_bps=%.0f jitter_s=%.6f", peerName, protocol, resp.Result.BandwidthBitsPerSecond, resp.Result.JitterSeconds)
+	results := resp.probeResults()
+	if results.success() {
+		log.Printf("probe succeeded peer=%s protocol=%s role=server client_to_server_bandwidth_bps=%.0f server_to_client_bandwidth_bps=%.0f client_to_server_jitter_s=%.6f server_to_client_jitter_s=%.6f", peerName, protocol, results.ClientToServer.BandwidthBitsPerSecond, results.ServerToClient.BandwidthBitsPerSecond, results.ClientToServer.JitterSeconds, results.ServerToClient.JitterSeconds)
 	} else {
-		log.Printf("probe failed peer=%s protocol=%s role=server: %s", peerName, protocol, resp.Result.Error)
+		log.Printf("probe failed peer=%s protocol=%s role=server: %s", peerName, protocol, results.errorMessage())
 	}
 }
 
 func (a *app) recordFailure(peerNode string, clientNode string, serverNode string, protocol string, duration time.Duration) {
-	a.metrics.Record(metricSample{
-		Key: metricKey{
-			LocalNode:  a.cfg.NodeName,
-			PeerNode:   peerNode,
-			ClientNode: clientNode,
-			ServerNode: serverNode,
-			Protocol:   protocol,
-		},
-		Success:              false,
-		ProbeDurationSeconds: duration.Seconds(),
-		LastRun:              time.Now(),
-	})
+	a.recordResultSamples(peerNode, clientNode, serverNode, protocol, failedProbeResults(duration.Seconds(), ""))
+}
+
+func (a *app) recordResultSamples(peerNode string, clientNode string, serverNode string, protocol string, results probeResults) {
+	a.recordActivity(time.Now())
+	a.metrics.Record(sampleFromResult(a.cfg.NodeName, peerNode, clientNode, serverNode, protocol, results.ClientToServer))
+	a.metrics.Record(sampleFromResult(a.cfg.NodeName, peerNode, serverNode, clientNode, protocol, results.ServerToClient))
 }
 
 func sampleFromResult(localNode string, peerNode string, clientNode string, serverNode string, protocol string, result probeResult) metricSample {
@@ -1095,12 +1184,12 @@ func (a *app) releasePort(port int) {
 	delete(a.activeServers, port)
 }
 
-func (a *app) runIperfClient(ctx context.Context, serverHost string, serverPort int, protocol string, bandwidth string, durationSeconds int) probeResult {
+func (a *app) runIperfClient(ctx context.Context, serverHost string, serverPort int, protocol string, bandwidth string, durationSeconds int) probeResults {
 	started := time.Now()
 	testCtx, cancel := context.WithTimeout(ctx, a.timeoutForSeconds(durationSeconds))
 	defer cancel()
 
-	args := []string{"-c", serverHost, "-p", strconv.Itoa(serverPort), "-t", strconv.Itoa(durationSeconds), "--json"}
+	args := []string{"-c", serverHost, "-p", strconv.Itoa(serverPort), "-t", strconv.Itoa(durationSeconds), "--json", "--bidir"}
 	if protocol == "udp" {
 		args = append(args, "--udp", "--bandwidth", bandwidth)
 	}
@@ -1111,7 +1200,7 @@ func (a *app) runIperfClient(ctx context.Context, serverHost string, serverPort 
 	stdout, err := cmd.Output()
 	duration := time.Since(started)
 	if testCtx.Err() != nil {
-		return probeResult{Success: false, DurationSeconds: duration.Seconds(), Error: testCtx.Err().Error()}
+		return failedProbeResults(duration.Seconds(), testCtx.Err().Error())
 	}
 	if err != nil {
 		message := strings.TrimSpace(stderr.String())
@@ -1121,21 +1210,36 @@ func (a *app) runIperfClient(ctx context.Context, serverHost string, serverPort 
 		if message == "" {
 			message = err.Error()
 		}
-		return probeResult{Success: false, DurationSeconds: duration.Seconds(), Error: message}
+		return failedProbeResults(duration.Seconds(), message)
 	}
 
-	measurement, err := parseIperfMeasurement(protocol, stdout)
+	measurements, err := parseIperfBidirMeasurements(protocol, stdout)
 	if err != nil {
-		return probeResult{Success: false, DurationSeconds: duration.Seconds(), Error: err.Error()}
+		return failedProbeResults(duration.Seconds(), err.Error())
 	}
-	return probeResult{
-		Success:                true,
-		BandwidthBitsPerSecond: measurement.BandwidthBitsPerSecond,
-		JitterSeconds:          measurement.JitterSeconds,
-		LostPackets:            measurement.LostPackets,
-		LossRatio:              measurement.LossRatio,
-		DurationSeconds:        duration.Seconds(),
+	return probeResults{
+		ClientToServer: probeResult{
+			Success:                true,
+			BandwidthBitsPerSecond: measurements.ClientToServer.BandwidthBitsPerSecond,
+			JitterSeconds:          measurements.ClientToServer.JitterSeconds,
+			LostPackets:            measurements.ClientToServer.LostPackets,
+			LossRatio:              measurements.ClientToServer.LossRatio,
+			DurationSeconds:        duration.Seconds(),
+		},
+		ServerToClient: probeResult{
+			Success:                true,
+			BandwidthBitsPerSecond: measurements.ServerToClient.BandwidthBitsPerSecond,
+			JitterSeconds:          measurements.ServerToClient.JitterSeconds,
+			LostPackets:            measurements.ServerToClient.LostPackets,
+			LossRatio:              measurements.ServerToClient.LossRatio,
+			DurationSeconds:        duration.Seconds(),
+		},
 	}
+}
+
+func failedProbeResults(durationSeconds float64, message string) probeResults {
+	result := probeResult{Success: false, DurationSeconds: durationSeconds, Error: message}
+	return probeResults{ClientToServer: result, ServerToClient: result}
 }
 
 func usableServerHost(advertised string, fallback string) string {
@@ -1153,15 +1257,23 @@ type iperfMeasurement struct {
 	LossRatio              float64
 }
 
+type iperfMeasurements struct {
+	ClientToServer iperfMeasurement
+	ServerToClient iperfMeasurement
+}
+
 type iperfOutput struct {
 	Error string   `json:"error"`
 	End   iperfEnd `json:"end"`
 }
 
 type iperfEnd struct {
-	Sum         *iperfSum `json:"sum"`
-	SumSent     *iperfSum `json:"sum_sent"`
-	SumReceived *iperfSum `json:"sum_received"`
+	Sum                     *iperfSum `json:"sum"`
+	SumSent                 *iperfSum `json:"sum_sent"`
+	SumReceived             *iperfSum `json:"sum_received"`
+	SumBidirReverse         *iperfSum `json:"sum_bidir_reverse"`
+	SumSentBidirReverse     *iperfSum `json:"sum_sent_bidir_reverse"`
+	SumReceivedBidirReverse *iperfSum `json:"sum_received_bidir_reverse"`
 }
 
 type iperfSum struct {
@@ -1174,21 +1286,61 @@ type iperfSum struct {
 }
 
 func parseIperfMeasurement(protocol string, data []byte) (iperfMeasurement, error) {
+	parsed, err := parseIperfOutput(data)
+	if err != nil {
+		return iperfMeasurement{}, err
+	}
+	return measurementFromCandidates(primaryIperfCandidates(protocol, parsed.End))
+}
+
+func parseIperfBidirMeasurements(protocol string, data []byte) (iperfMeasurements, error) {
+	parsed, err := parseIperfOutput(data)
+	if err != nil {
+		return iperfMeasurements{}, err
+	}
+
+	clientToServer, err := measurementFromCandidates(bidirClientToServerCandidates(protocol, parsed.End))
+	if err != nil {
+		return iperfMeasurements{}, fmt.Errorf("client-to-server summary: %w", err)
+	}
+	serverToClient, err := measurementFromCandidates(bidirServerToClientCandidates(parsed.End))
+	if err != nil {
+		return iperfMeasurements{}, fmt.Errorf("server-to-client summary: %w", err)
+	}
+
+	return iperfMeasurements{ClientToServer: clientToServer, ServerToClient: serverToClient}, nil
+}
+
+func parseIperfOutput(data []byte) (iperfOutput, error) {
 	var parsed iperfOutput
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		return iperfMeasurement{}, fmt.Errorf("parse iperf3 json: %w", err)
+		return iperfOutput{}, fmt.Errorf("parse iperf3 json: %w", err)
 	}
 	if parsed.Error != "" {
-		return iperfMeasurement{}, errors.New(parsed.Error)
+		return iperfOutput{}, errors.New(parsed.Error)
 	}
+	return parsed, nil
+}
 
-	var candidates []*iperfSum
+func primaryIperfCandidates(protocol string, end iperfEnd) []*iperfSum {
 	if protocol == "tcp" {
-		candidates = []*iperfSum{parsed.End.SumReceived, parsed.End.Sum, parsed.End.SumSent}
-	} else {
-		candidates = []*iperfSum{parsed.End.Sum, parsed.End.SumReceived, parsed.End.SumSent}
+		return []*iperfSum{end.SumReceived, end.Sum, end.SumSent}
 	}
+	return []*iperfSum{end.Sum, end.SumReceived, end.SumSent}
+}
 
+func bidirClientToServerCandidates(protocol string, end iperfEnd) []*iperfSum {
+	if protocol == "udp" {
+		return []*iperfSum{end.SumReceived, end.Sum, end.SumSent}
+	}
+	return primaryIperfCandidates(protocol, end)
+}
+
+func bidirServerToClientCandidates(end iperfEnd) []*iperfSum {
+	return []*iperfSum{end.SumReceivedBidirReverse, end.SumBidirReverse, end.SumSentBidirReverse}
+}
+
+func measurementFromCandidates(candidates []*iperfSum) (iperfMeasurement, error) {
 	var sum *iperfSum
 	for _, candidate := range candidates {
 		if candidate == nil {

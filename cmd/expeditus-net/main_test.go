@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParsePortRange(t *testing.T) {
@@ -107,6 +108,62 @@ func TestTestSlotAllowsOneActiveTest(t *testing.T) {
 	}
 }
 
+func TestIdleActivityWarnsAfterTwentyMinutes(t *testing.T) {
+	started := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	a := &app{lastActivity: started}
+
+	idleFor, warn, restart := a.checkIdleActivity(started.Add(activityWarningAfter))
+
+	if idleFor != activityWarningAfter {
+		t.Fatalf("got idle duration %s, want %s", idleFor, activityWarningAfter)
+	}
+	if !warn {
+		t.Fatalf("expected warning after %s idle", activityWarningAfter)
+	}
+	if restart {
+		t.Fatalf("did not expect restart after %s idle", activityWarningAfter)
+	}
+}
+
+func TestIdleActivityWarnsOnceUntilActivity(t *testing.T) {
+	started := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	a := &app{lastActivity: started}
+
+	_, warn, restart := a.checkIdleActivity(started.Add(activityWarningAfter))
+	if !warn || restart {
+		t.Fatalf("first check got warn=%v restart=%v, want warn=true restart=false", warn, restart)
+	}
+
+	_, warn, restart = a.checkIdleActivity(started.Add(activityWarningAfter + time.Minute))
+	if warn || restart {
+		t.Fatalf("second check got warn=%v restart=%v, want warn=false restart=false", warn, restart)
+	}
+
+	activityAt := started.Add(activityWarningAfter + 2*time.Minute)
+	a.recordActivity(activityAt)
+	_, warn, restart = a.checkIdleActivity(activityAt.Add(activityWarningAfter))
+	if !warn || restart {
+		t.Fatalf("post-activity check got warn=%v restart=%v, want warn=true restart=false", warn, restart)
+	}
+}
+
+func TestIdleActivityRestartsAfterOneHour(t *testing.T) {
+	started := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	a := &app{lastActivity: started}
+
+	idleFor, warn, restart := a.checkIdleActivity(started.Add(activityRestartAfter))
+
+	if idleFor != activityRestartAfter {
+		t.Fatalf("got idle duration %s, want %s", idleFor, activityRestartAfter)
+	}
+	if warn {
+		t.Fatalf("did not expect warning when restart is due")
+	}
+	if !restart {
+		t.Fatalf("expected restart after %s idle", activityRestartAfter)
+	}
+}
+
 func TestParseUDPMeasurement(t *testing.T) {
 	data := []byte(`{
 		"end": {
@@ -132,6 +189,61 @@ func TestParseUDPMeasurement(t *testing.T) {
 	}
 	if math.Abs(measurement.LossRatio-0.002) > 0.000000001 {
 		t.Fatalf("unexpected loss ratio: %v", measurement.LossRatio)
+	}
+}
+
+func TestParseBidirMeasurements(t *testing.T) {
+	data := []byte(`{
+		"end": {
+			"sum_received": {
+				"seconds": 5.0,
+				"bits_per_second": 1000,
+				"jitter_ms": 0.5,
+				"lost_packets": 1,
+				"packets": 100,
+				"lost_percent": 1
+			},
+			"sum_received_bidir_reverse": {
+				"seconds": 5.0,
+				"bits_per_second": 2000,
+				"jitter_ms": 1.5,
+				"lost_packets": 3,
+				"packets": 100,
+				"lost_percent": 3
+			}
+		}
+	}`)
+	measurements, err := parseIperfBidirMeasurements("udp", data)
+	if err != nil {
+		t.Fatalf("parseIperfBidirMeasurements returned error: %v", err)
+	}
+	if measurements.ClientToServer.BandwidthBitsPerSecond != 1000 {
+		t.Fatalf("unexpected client-to-server bandwidth: %v", measurements.ClientToServer.BandwidthBitsPerSecond)
+	}
+	if measurements.ServerToClient.BandwidthBitsPerSecond != 2000 {
+		t.Fatalf("unexpected server-to-client bandwidth: %v", measurements.ServerToClient.BandwidthBitsPerSecond)
+	}
+	if math.Abs(measurements.ServerToClient.JitterSeconds-0.0015) > 0.000000001 {
+		t.Fatalf("unexpected server-to-client jitter: %v", measurements.ServerToClient.JitterSeconds)
+	}
+	if math.Abs(measurements.ServerToClient.LossRatio-0.03) > 0.000000001 {
+		t.Fatalf("unexpected server-to-client loss ratio: %v", measurements.ServerToClient.LossRatio)
+	}
+}
+
+func TestRecordResultSamplesEmitsBothDirections(t *testing.T) {
+	a := &app{cfg: &config{NodeName: "a"}, metrics: newMetricStore()}
+	a.recordResultSamples("b", "a", "b", "tcp", probeResults{
+		ClientToServer: probeResult{Success: true, BandwidthBitsPerSecond: 1000},
+		ServerToClient: probeResult{Success: true, BandwidthBitsPerSecond: 2000},
+	})
+
+	rendered := a.metrics.Render()
+	if !strings.Contains(rendered, `expeditus_iperf_bandwidth_bits_per_second{local_node="a",peer_node="b",client_node="a",server_node="b",protocol="tcp"} 1000`) {
+		t.Fatalf("rendered metrics missing client-to-server bandwidth sample:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `expeditus_iperf_bandwidth_bits_per_second{local_node="a",peer_node="b",client_node="b",server_node="a",protocol="tcp"} 2000`) {
+		t.Fatalf("rendered metrics missing server-to-client bandwidth sample:\n%s", rendered)
 	}
 }
 

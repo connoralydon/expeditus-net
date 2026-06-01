@@ -14,7 +14,7 @@ The daemon serves Prometheus text metrics at `/metrics`:
 - `expeditus_iperf_probe_duration_seconds`
 - `expeditus_iperf_last_run_timestamp_seconds`
 
-By default each peer round runs two sequential probes: a UDP quality probe at `10M` for jitter and loss, then a TCP probe for maximum bandwidth. Jitter and packet loss are only emitted for UDP probes.
+By default each peer round runs two sequential bidirectional probes with `iperf3 --bidir`: a UDP quality probe at `10M` for jitter and loss, then a TCP probe for maximum bandwidth. Each probe emits samples for both `client_node`/`server_node` directions. Jitter and packet loss are only emitted for UDP probes.
 
 ## Ports
 
