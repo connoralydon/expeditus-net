@@ -79,6 +79,8 @@
             "--iperf-port-range" cfg.iperfPortRange
             "--interval" cfg.interval
             "--duration" cfg.duration
+            "--warmup" cfg.warmup
+            "--traffic-interval" cfg.trafficInterval
             "--protocol" cfg.protocol
             "--bandwidth" cfg.bandwidth
           ]
@@ -143,14 +145,26 @@
 
             duration = lib.mkOption {
               type = lib.types.str;
-              default = "5s";
+              default = "15s";
               description = "iperf3 test duration.";
+            };
+
+            warmup = lib.mkOption {
+              type = lib.types.str;
+              default = "3s";
+              description = "iperf3 warmup duration omitted from probe results.";
+            };
+
+            trafficInterval = lib.mkOption {
+              type = lib.types.str;
+              default = "30s";
+              description = "Interval between aggregate local host traffic samples.";
             };
 
             protocol = lib.mkOption {
               type = lib.types.enum [ "both" "udp" "tcp" ];
               default = "both";
-              description = "iperf3 protocol mode. The default runs UDP quality and TCP bandwidth probes sequentially.";
+              description = "iperf3 protocol mode. The default runs UDP quality and one-way TCP bandwidth probes sequentially.";
             };
 
             bandwidth = lib.mkOption {

@@ -52,6 +52,15 @@ func TestParseConfigDefaultsToBothProtocols(t *testing.T) {
 	if cfg.Bandwidth != "10M" {
 		t.Fatalf("got bandwidth %q, want 10M", cfg.Bandwidth)
 	}
+	if cfg.Duration != 15*time.Second {
+		t.Fatalf("got duration %s, want 15s", cfg.Duration)
+	}
+	if cfg.Warmup != 3*time.Second {
+		t.Fatalf("got warmup %s, want 3s", cfg.Warmup)
+	}
+	if cfg.TrafficInterval != 30*time.Second {
+		t.Fatalf("got traffic interval %s, want 30s", cfg.TrafficInterval)
+	}
 	protocols := cfg.probeProtocols()
 	if len(protocols) != 2 || protocols[0] != "udp" || protocols[1] != "tcp" {
 		t.Fatalf("got probe protocols %v, want [udp tcp]", protocols)
@@ -373,6 +382,79 @@ func TestParseBidirMeasurements(t *testing.T) {
 	}
 }
 
+func TestIperfTCPArgsAreDirectionalWithWarmup(t *testing.T) {
+	args := iperfClientArgs("10.0.0.2", 5201, "tcp", "", 15, 3, true, false)
+	if hasArg(args, "--bidir") {
+		t.Fatalf("tcp args included --bidir: %v", args)
+	}
+	if !hasArg(args, "--reverse") {
+		t.Fatalf("tcp reverse args missing --reverse: %v", args)
+	}
+	if !hasArgPair(args, "--omit", "3") {
+		t.Fatalf("tcp args missing warmup omit: %v", args)
+	}
+	if !hasArgPair(args, "-t", "15") {
+		t.Fatalf("tcp args missing duration: %v", args)
+	}
+}
+
+func TestIperfUDPArgsRemainBidir(t *testing.T) {
+	args := iperfClientArgs("10.0.0.2", 5201, "udp", "10M", 15, 3, false, true)
+	if !hasArg(args, "--bidir") {
+		t.Fatalf("udp args missing --bidir: %v", args)
+	}
+	if !hasArgPair(args, "--bandwidth", "10M") {
+		t.Fatalf("udp args missing bandwidth: %v", args)
+	}
+}
+
+func hasArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasArgPair(args []string, key string, value string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == key && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func TestParseProcNetDevAggregatesNonLoopbackTraffic(t *testing.T) {
+	data := []byte(`Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 10 1 0 0 0 0 0 0 20 2 0 0 0 0 0 0
+  eth0: 100 1 0 0 0 0 0 0 200 2 0 0 0 0 0 0
+ wlan0: 300 3 0 0 0 0 0 0 500 5 0 0 0 0 0 0
+`)
+	counters, err := parseProcNetDev(data)
+	if err != nil {
+		t.Fatalf("parseProcNetDev returned error: %v", err)
+	}
+	if counters.ReceiveBytes != 400 {
+		t.Fatalf("got receive bytes %d, want 400", counters.ReceiveBytes)
+	}
+	if counters.TransmitBytes != 700 {
+		t.Fatalf("got transmit bytes %d, want 700", counters.TransmitBytes)
+	}
+}
+
+func TestTrafficBitsPerSecond(t *testing.T) {
+	rate := trafficBitsPerSecond(1250, 1000, 2)
+	if rate != 1000 {
+		t.Fatalf("got rate %v, want 1000", rate)
+	}
+	if trafficBitsPerSecond(1000, 1250, 2) != 0 {
+		t.Fatalf("counter reset should produce zero rate")
+	}
+}
+
 func TestRecordResultSamplesEmitsBothDirections(t *testing.T) {
 	a := &app{cfg: &config{NodeName: "a"}, metrics: newMetricStore()}
 	a.recordResultSamples("b", "a", "b", "tcp", probeResults{
@@ -432,5 +514,29 @@ func TestMetricsRender(t *testing.T) {
 	}
 	if strings.Contains(rendered, `expeditus_iperf_jitter_seconds{local_node="a",peer_node="b",client_node="a",server_node="b",protocol="tcp"}`) {
 		t.Fatalf("rendered metrics included tcp jitter sample:\n%s", rendered)
+	}
+}
+
+func TestMetricsRenderHostTraffic(t *testing.T) {
+	store := newMetricStore()
+	store.RecordTraffic(trafficSample{
+		LocalNode:             "a",
+		ReceiveBitsPerSecond:  100,
+		TransmitBitsPerSecond: 200,
+		LastRun:               time.Unix(123, 0),
+	})
+
+	rendered := store.Render()
+	if !strings.Contains(rendered, `expeditus_host_receive_bits_per_second{local_node="a"} 100`) {
+		t.Fatalf("rendered metrics missing host receive sample:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `expeditus_host_transmit_bits_per_second{local_node="a"} 200`) {
+		t.Fatalf("rendered metrics missing host transmit sample:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `expeditus_host_traffic_last_run_timestamp_seconds{local_node="a"} 123`) {
+		t.Fatalf("rendered metrics missing host traffic timestamp:\n%s", rendered)
+	}
+	if strings.Contains(rendered, `expeditus_host_receive_bits_per_second{local_node="a",peer_node=`) {
+		t.Fatalf("host traffic metric included peer labels:\n%s", rendered)
 	}
 }

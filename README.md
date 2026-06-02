@@ -13,8 +13,13 @@ The daemon serves Prometheus text metrics at `/metrics`:
 - `expeditus_iperf_loss_ratio`
 - `expeditus_iperf_probe_duration_seconds`
 - `expeditus_iperf_last_run_timestamp_seconds`
+- `expeditus_host_receive_bits_per_second`
+- `expeditus_host_transmit_bits_per_second`
+- `expeditus_host_traffic_last_run_timestamp_seconds`
 
-By default each peer round acquires a pair lease, then runs two sequential bidirectional probes with `iperf3 --bidir`: a UDP quality probe at `10M` for jitter and loss, then a TCP probe for maximum bandwidth. Each probe emits samples for both `client_node`/`server_node` directions. Jitter and packet loss are only emitted for UDP probes.
+By default each peer round acquires a pair lease, then runs a UDP quality probe at `10M` with `iperf3 --bidir` for jitter and loss, followed by two one-way TCP bandwidth probes for maximum bandwidth in each direction. Each active probe emits samples for both `client_node`/`server_node` directions. Jitter and packet loss are only emitted for UDP probes.
+
+The daemon also samples aggregate non-loopback host traffic from `/proc/net/dev` every `30s` and exports receive/transmit rates with only the `local_node` label.
 
 ## Ports
 
@@ -34,7 +39,7 @@ nix run . -- \
 
 Run the same daemon on the neighbor with the opposite bind and neighbor addresses.
 
-Use `--protocol udp`, `--protocol tcp`, or `--protocol both` to override the default probe mode. `--bandwidth` only controls the UDP target rate and defaults to `10M`.
+Use `--protocol udp`, `--protocol tcp`, or `--protocol both` to override the default probe mode. `--bandwidth` only controls the UDP target rate and defaults to `10M`. The default active probe duration is `15s`, with a `3s` `--warmup` omitted from iperf results.
 
 Only one node initiates probes for each peer pair: the node with the lexicographically smaller node name. That owner alternates roles per neighbor. On one round it asks the neighbor to start an `iperf3` server and runs the client locally. On the next round it starts the server and asks the neighbor to run the client.
 
@@ -73,6 +78,9 @@ Set `--token` or `--token-file` on every node to require a shared bearer token f
             iperfPortRange = "5201-5210";
             protocol = "both";
             bandwidth = "10M";
+            duration = "15s";
+            warmup = "3s";
+            trafficInterval = "30s";
             openFirewall = true;
           };
         }
