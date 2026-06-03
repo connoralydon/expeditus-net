@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	appVersion             = "v1.0.1"
+	appVersion             = "v1.0.2"
 	defaultBindAddress     = ":9119"
 	defaultIperfPortRange  = "5201-5210"
 	defaultProtocol        = "both"
@@ -914,6 +914,10 @@ func (a *app) runTrafficMonitor(ctx context.Context) {
 		return
 	}
 	previousAt := time.Now()
+	a.metrics.RecordTraffic(trafficSample{
+		LocalNode: a.cfg.NodeName,
+		LastRun:   previousAt,
+	})
 
 	ticker := time.NewTicker(a.cfg.TrafficInterval)
 	defer ticker.Stop()
