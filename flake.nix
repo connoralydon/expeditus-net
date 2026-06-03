@@ -18,7 +18,7 @@
         let
           expeditus-net = pkgs.buildGoModule {
             pname = "expeditus-net";
-			version = "1.0.2";
+			version = "1.0.3";
             src = ./.;
             vendorHash = null;
 

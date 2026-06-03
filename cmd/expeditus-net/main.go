@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	appVersion             = "v1.0.2"
+	appVersion             = "v1.0.3"
 	defaultBindAddress     = ":9119"
 	defaultIperfPortRange  = "5201-5210"
 	defaultProtocol        = "both"
