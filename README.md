@@ -7,6 +7,7 @@
 The daemon serves Prometheus text metrics at `/metrics`:
 
 - `expeditus_iperf_probe_success`
+- `expeditus_iperf_probe_active`
 - `expeditus_iperf_bandwidth_bits_per_second`
 - `expeditus_iperf_jitter_seconds`
 - `expeditus_iperf_lost_packets`
@@ -17,7 +18,7 @@ The daemon serves Prometheus text metrics at `/metrics`:
 - `expeditus_host_transmit_bits_per_second`
 - `expeditus_host_traffic_last_run_timestamp_seconds`
 
-By default each peer round acquires a pair lease, then runs a UDP quality probe at `10M` with `iperf3 --bidir` for jitter and loss, followed by two one-way TCP bandwidth probes for maximum bandwidth in each direction. Each active probe emits samples for both `client_node`/`server_node` directions. Jitter and packet loss are only emitted for UDP probes.
+By default each peer round acquires a pair lease, then runs a UDP quality probe at `10M` with `iperf3 --bidir` for jitter and loss, followed by two one-way TCP bandwidth probes for maximum bandwidth in each direction. Each active probe emits samples for both `client_node`/`server_node` directions. Jitter and packet loss are only emitted for UDP probes. `expeditus_iperf_probe_active` is a binary gauge with only the `local_node` label and is `1` while a local `iperf3` client or server process is running.
 
 The daemon also samples aggregate non-loopback host traffic from `/proc/net/dev` every `30s` and exports receive/transmit rates with only the `local_node` label.
 

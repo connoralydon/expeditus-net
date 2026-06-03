@@ -236,7 +236,7 @@ func TestRunPeerProbeRecordsFailuresAfterBusyLeaseRetry(t *testing.T) {
 	}))
 	defer server.Close()
 
-	a := &app{cfg: &config{NodeName: "a", Bandwidth: "10M"}, client: server.Client(), metrics: newMetricStore()}
+	a := &app{cfg: &config{NodeName: "a", Bandwidth: "10M"}, client: server.Client(), metrics: newMetricStore("a")}
 	a.runPeerProbe(context.Background(), neighbor{BaseURL: server.URL, Node: "b"}, "b", []string{"udp", "tcp"}, true, 1)
 
 	if requests.Load() < 2 {
@@ -456,7 +456,7 @@ func TestTrafficBitsPerSecond(t *testing.T) {
 }
 
 func TestRecordResultSamplesEmitsBothDirections(t *testing.T) {
-	a := &app{cfg: &config{NodeName: "a"}, metrics: newMetricStore()}
+	a := &app{cfg: &config{NodeName: "a"}, metrics: newMetricStore("a")}
 	a.recordResultSamples("b", "a", "b", "tcp", probeResults{
 		ClientToServer: probeResult{Success: true, BandwidthBitsPerSecond: 1000},
 		ServerToClient: probeResult{Success: true, BandwidthBitsPerSecond: 2000},
@@ -472,7 +472,7 @@ func TestRecordResultSamplesEmitsBothDirections(t *testing.T) {
 }
 
 func TestMetricsRender(t *testing.T) {
-	store := newMetricStore()
+	store := newMetricStore("a")
 	store.Record(metricSample{
 		Key: metricKey{
 			LocalNode:  "a",
@@ -517,8 +517,27 @@ func TestMetricsRender(t *testing.T) {
 	}
 }
 
+func TestMetricsRenderIperfActiveBinary(t *testing.T) {
+	store := newMetricStore("a")
+	if rendered := store.Render(); !strings.Contains(rendered, `expeditus_iperf_probe_active{local_node="a"} 0`) {
+		t.Fatalf("rendered metrics missing inactive iperf sample:\n%s", rendered)
+	}
+
+	finishFirst := store.BeginIperf()
+	finishSecond := store.BeginIperf()
+	finishFirst()
+	if rendered := store.Render(); !strings.Contains(rendered, `expeditus_iperf_probe_active{local_node="a"} 1`) {
+		t.Fatalf("rendered metrics missing active iperf sample:\n%s", rendered)
+	}
+
+	finishSecond()
+	if rendered := store.Render(); !strings.Contains(rendered, `expeditus_iperf_probe_active{local_node="a"} 0`) {
+		t.Fatalf("rendered metrics did not return to inactive iperf sample:\n%s", rendered)
+	}
+}
+
 func TestMetricsRenderHostTraffic(t *testing.T) {
-	store := newMetricStore()
+	store := newMetricStore("a")
 	store.RecordTraffic(trafficSample{
 		LocalNode:             "a",
 		ReceiveBitsPerSecond:  100,

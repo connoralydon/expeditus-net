@@ -242,9 +242,11 @@ type trafficSample struct {
 }
 
 type metricStore struct {
-	mu      sync.RWMutex
-	samples map[metricKey]metricSample
-	traffic *trafficSample
+	mu               sync.RWMutex
+	localNode        string
+	samples          map[metricKey]metricSample
+	traffic          *trafficSample
+	activeIperfCount int
 }
 
 type httpStatusError struct {
@@ -282,7 +284,7 @@ func main() {
 	a := &app{
 		cfg:           cfg,
 		client:        &http.Client{},
-		metrics:       newMetricStore(),
+		metrics:       newMetricStore(cfg.NodeName),
 		activeServers: make(map[int]struct{}),
 		roleCounts:    make(map[string]int),
 		peerInfos:     make(map[string]infoResponse),
@@ -1516,6 +1518,13 @@ func waitForIperfServerDone(done <-chan error) {
 	<-done
 }
 
+func (a *app) beginIperf() func() {
+	if a.metrics == nil {
+		return func() {}
+	}
+	return a.metrics.BeginIperf()
+}
+
 func (a *app) recordFailure(peerNode string, clientNode string, serverNode string, protocol string, duration time.Duration) {
 	a.recordResultSamples(peerNode, clientNode, serverNode, protocol, failedProbeResults(duration.Seconds(), ""))
 }
@@ -1701,8 +1710,10 @@ func (a *app) startIperfServer(timeout time.Duration) (int, time.Time, <-chan er
 		}
 
 		done := make(chan error, 1)
+		finishIperf := a.beginIperf()
 		go func(port int) {
 			err := cmd.Wait()
+			finishIperf()
 			cancel()
 			a.releasePort(port)
 			done <- err
@@ -1770,7 +1781,9 @@ func (a *app) runIperfBidirClient(ctx context.Context, serverHost string, server
 	cmd := exec.CommandContext(testCtx, "iperf3", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	finishIperf := a.beginIperf()
 	stdout, err := cmd.Output()
+	finishIperf()
 	duration := time.Since(started)
 	if testCtx.Err() != nil {
 		return failedProbeResults(duration.Seconds(), testCtx.Err().Error())
@@ -1819,7 +1832,9 @@ func (a *app) runIperfClientDirection(ctx context.Context, serverHost string, se
 	cmd := exec.CommandContext(testCtx, "iperf3", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	finishIperf := a.beginIperf()
 	stdout, err := cmd.Output()
+	finishIperf()
 	duration := time.Since(started)
 	if testCtx.Err() != nil {
 		return failedProbeResult(duration.Seconds(), testCtx.Err().Error())
@@ -1994,14 +2009,27 @@ func parseIperfError(data []byte) string {
 	return parsed.Error
 }
 
-func newMetricStore() *metricStore {
-	return &metricStore{samples: make(map[metricKey]metricSample)}
+func newMetricStore(localNode string) *metricStore {
+	return &metricStore{localNode: localNode, samples: make(map[metricKey]metricSample)}
 }
 
 func (m *metricStore) Record(sample metricSample) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.samples[sample.Key] = sample
+}
+
+func (m *metricStore) BeginIperf() func() {
+	m.mu.Lock()
+	m.activeIperfCount++
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.activeIperfCount > 0 {
+			m.activeIperfCount--
+		}
+	}
 }
 
 func (m *metricStore) RecordTraffic(sample trafficSample) {
@@ -2015,6 +2043,8 @@ func (m *metricStore) Render() string {
 	defer m.mu.RUnlock()
 
 	var b strings.Builder
+	b.WriteString("# HELP expeditus_iperf_probe_active Whether a local iperf3 client or server process is currently running.\n")
+	b.WriteString("# TYPE expeditus_iperf_probe_active gauge\n")
 	b.WriteString("# HELP expeditus_iperf_probe_success Whether the last iperf probe completed successfully.\n")
 	b.WriteString("# TYPE expeditus_iperf_probe_success gauge\n")
 	b.WriteString("# HELP expeditus_iperf_bandwidth_bits_per_second Measured uncapped TCP iperf bandwidth in bits per second.\n")
@@ -2035,6 +2065,11 @@ func (m *metricStore) Render() string {
 	b.WriteString("# TYPE expeditus_host_transmit_bits_per_second gauge\n")
 	b.WriteString("# HELP expeditus_host_traffic_last_run_timestamp_seconds Unix timestamp of the last host traffic sample.\n")
 	b.WriteString("# TYPE expeditus_host_traffic_last_run_timestamp_seconds gauge\n")
+	activeIperf := 0
+	if m.activeIperfCount > 0 {
+		activeIperf = 1
+	}
+	fmt.Fprintf(&b, "expeditus_iperf_probe_active{local_node=\"%s\"} %d\n", escapeLabel(m.localNode), activeIperf)
 
 	samples := make([]metricSample, 0, len(m.samples))
 	for _, sample := range m.samples {
